@@ -59,6 +59,18 @@ topicMemorySchema.index({ agentId: 1, normalizedTopic: 1, createdAt: -1 });
 // Filter by outcome, e.g. the "rejected topics" view.
 topicMemorySchema.index({ agentId: 1, decision: 1, createdAt: -1 });
 
+// At most one *published* memory per topic per agent. This is what makes the
+// publisher's post-publication upsert concurrency-safe: two cycles racing to
+// record the same published topic cannot both insert — one wins, the other's
+// insert fails with a duplicate-key error the publisher treats as an idempotent
+// success. The partialFilterExpression scopes the constraint to published rows
+// only, so the audit log may still hold many 'rejected'/'deferred' entries for
+// the same topic (repetition history the memory phase relies on).
+topicMemorySchema.index(
+  { agentId: 1, normalizedTopic: 1 },
+  { unique: true, partialFilterExpression: { decision: 'published' } }
+);
+
 // Mongoose 9 document middleware is promise-based: no `next` parameter.
 topicMemorySchema.pre('validate', function normalize() {
   if (this.topic && (!this.normalizedTopic || this.isModified('topic'))) {
