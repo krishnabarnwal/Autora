@@ -52,7 +52,7 @@ cp .env.example server/.env
 | `MONGODB_URI`  | MongoDB connection string. Empty falls back to ephemeral dev DB |
 | `LLM_PROVIDER` | `gemini` or `mock`                                            |
 | `LLM_API_KEY`  | API key for the selected provider                             |
-| `LLM_MODEL`    | Model id, e.g. `gemini-2.5-flash`                             |
+| `LLM_MODEL`    | Model id, e.g. `gemini-3.5-flash`                             |
 | `AGENT_MODE`   | `demo` or `production` — see below                             |
 | `PORT`         | Backend port, default `5000`                                  |
 | `CORS_ORIGIN`  | Comma-separated allowed browser origins                       |

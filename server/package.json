@@ -11,12 +11,15 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test test/"
+    "test": "node --test --test-concurrency=1 --test-timeout=60000 \"test/**/*.test.js\""
   },
   "dependencies": {
     "cors": "2.8.5",
     "dotenv": "17.2.3",
-    "express": "5.1.0"
+    "express": "5.1.0",
+    "mongoose": "9.9.1"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "mongodb-memory-server": "11.2.0"
+  }
 }
