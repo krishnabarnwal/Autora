@@ -1,0 +1,28 @@
+@import 'tailwindcss';
+
+/* Design tokens for the dashboard shell. Kept small on purpose; the full
+   visual system lands with the dashboard build in Phase 14. */
+@theme {
+  --color-ink-950: #07090f;
+  --color-ink-900: #0c1018;
+  --color-ink-800: #141a26;
+  --color-ink-700: #1e2635;
+  --color-ink-500: #6b7789;
+  --color-ink-300: #aab4c4;
+  --color-signal: #4ade80;
+  --color-accent: #6ea8fe;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-ink-950);
+  color: var(--color-ink-300);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}

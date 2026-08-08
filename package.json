@@ -1,0 +1,14 @@
+{
+  "name": "autonomous-ai-creator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PS3 - An autonomous AI persona that discovers, judges, and publishes technology commentary without human prompting",
+  "scripts": {
+    "install:all": "npm install --prefix server && npm install --prefix client",
+    "dev:server": "npm run dev --prefix server",
+    "dev:client": "npm run dev --prefix client",
+    "start": "npm start --prefix server",
+    "build": "npm run build --prefix client",
+    "test": "npm test --prefix server"
+  }
+}
