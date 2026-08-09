@@ -14,6 +14,14 @@
  *     generatePost()        LLM CALL #2 (only on a publish decision)
  *     publishFinalPost()    the Post + its published memory (0 LLM calls)
  *     recordDecision()      the non-published candidate's audit row (0 LLM calls)
+ *     breeth.addEpisode()   Phase 12.5 strategic memory (0 LLM calls, optional)
+ *
+ * Phase 12.5 note: Breeth is an OPTIONAL second memory layer, mirrored at the end
+ * of the cycle. MongoDB stays authoritative — the repetition gate above and the
+ * TopicMemory unique index are unchanged, and no Breeth result can block, allow,
+ * or alter a decision. A Breeth outage produces a warning and nothing else: it is
+ * never added to `errors`, never sets `failed`, and so can never reach the
+ * scheduler's backoff.
  *
  * The hard budget: at most two LLM calls per cycle, and zero for a cycle whose
  * candidates are all BLOCKED (or empty). runCycle never decides *when* a cycle
@@ -36,6 +44,7 @@ import { checkRepetition, recordDecision } from '../memory/index.js';
 import { evaluateCandidates, DECISIONS } from '../editorial/index.js';
 import { generatePost } from '../generation/index.js';
 import { publishFinalPost } from '../publisher/index.js';
+import { breethService, EPISODE } from '../breeth/index.js';
 
 const log = logger('AGENT');
 
@@ -52,6 +61,10 @@ export const DEFAULT_SERVICES = Object.freeze({
   generatePost,
   publishFinalPost,
   recordDecision,
+  // Phase 12.5 — optional strategic memory. Disabled by default in config, so
+  // the real service is a no-op unless the operator opts in; a test injects a
+  // recording double. Never authoritative, never able to fail a cycle.
+  breeth: breethService,
 });
 
 /** How the repetition gate sorted a candidate. */
@@ -107,11 +120,16 @@ function isNonPublish(editor) {
 function buildResult({
   agentId, cycleId = null, outcome, failed = false, providerCalls = 0,
   publisher = null, editorial = null, generation = null, memory = null,
-  stats = null, errors = [],
+  breeth = null, stats = null, errors = [],
 }) {
   return {
     agentId, cycleId, outcome, failed, providerCalls,
-    publisher, editorial, generation, memory, stats, errors,
+    publisher, editorial, generation, memory,
+    // Phase 12.5 — what strategic memory did, purely informational. `null` means
+    // Breeth was off or had nothing to record. It is NEVER folded into `failed`,
+    // never added to `errors`, and never written to Agent state by the worker.
+    breeth,
+    stats, errors,
   };
 }
 
@@ -160,6 +178,55 @@ async function recordDeferredCandidate(agentId, editor, viable, cycleId, recordF
     log.warn('Could not record the deferred candidate', {
       agentId, code: err?.code, title: String(candidate.title).slice(0, 80),
     });
+    return null;
+  }
+}
+
+/**
+ * Phase 12.5 — mirror the cycle's decision into Breeth strategic memory.
+ *
+ * Deliberately the last thing a cycle does, and deliberately incapable of
+ * changing its outcome. The Breeth service already converts every failure into a
+ * resolved `{ok:false}` value, so this cannot throw; the try/catch is a second
+ * belt in case an injected double misbehaves. Nothing here is awaited by a
+ * decision, nothing here is returned to the worker's failure tally, and nothing
+ * here calls an LLM.
+ *
+ * One episode per cycle at most. The agent's *decisions* are the high-value
+ * signal — a stream of per-candidate events would bloat the graph and the quota
+ * for no gain.
+ *
+ * @returns {Promise<{event:string, ok:boolean, errorCode:string|null}|null>} a
+ *   summary for the cycle result, or null when nothing was worth recording.
+ */
+async function recordStrategicMemory({ breeth, agent, outcome, editor, topic, category, cycleId }) {
+  try {
+    if (!breeth || typeof breeth.addEpisode !== 'function') return null;
+    // Skip the work entirely when Breeth is off: no payload built, no call made.
+    if (typeof breeth.isEnabled === 'function' && !breeth.isEnabled()) return null;
+    if (!topic) return null;
+
+    let event;
+    if (outcome === OUTCOME.PUBLISHED) event = EPISODE.PUBLISHED;
+    else if (outcome === OUTCOME.DUPLICATE) event = EPISODE.REPETITION_SKIP;
+    else if (outcome === OUTCOME.FAILED) event = EPISODE.GENERATION_FAILED;
+    else event = EPISODE.DEFERRED;
+
+    const result = await breeth.addEpisode({
+      event,
+      agentId: agent.agentId,
+      persona: agent.persona?.name,
+      topic,
+      category,
+      reason: editor?.reason,
+      confidence: Number.isFinite(editor?.confidence) ? editor.confidence : undefined,
+      cycleId,
+    });
+
+    return { event, ok: Boolean(result?.ok), errorCode: result?.errorCode ?? null };
+  } catch (err) {
+    // A Breeth problem is never a cycle problem. Log a sanitized code and return.
+    log.warn('Strategic memory write skipped', { agentId: agent?.agentId, code: err?.code });
     return null;
   }
 }
@@ -336,6 +403,18 @@ export async function runCycle(agent, options = {}) {
   // --- Memory for the candidate we did not publish ----------------------------
   const memory = await recordDeferredCandidate(agentId, editor, viable, cycleId, services.recordDecision);
 
+  // --- Phase 12.5: Breeth strategic memory (0 LLM calls, never fatal) ---------
+  const selectedTopic = publisher?.post?.title || editor?.title || viable[0]?.title || null;
+  const breeth = await recordStrategicMemory({
+    breeth: services.breeth,
+    agent,
+    outcome,
+    editor,
+    topic: selectedTopic,
+    category: agent.persona?.domain,
+    cycleId,
+  });
+
   const providerCalls = (provider?.calls?.length ?? 0) - providerCallsBefore;
   const published = publisher?.created === true;
 
@@ -349,6 +428,7 @@ export async function runCycle(agent, options = {}) {
     editorial: editor,
     generation: generation_,
     memory,
+    breeth,
     stats: statBlock({
       discovered: discovered.candidates.length,
       afterFilter: viable.length,

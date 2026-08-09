@@ -1,6 +1,6 @@
 # PROJECT HANDOFF — Autonomous AI Creator
 
-_Handoff rewritten 2026-08-09 after Phase 12. Everything below is verified against the actual repository (files read, tests run, `git status` captured), not the README's forward-looking text — the README and `client/src/App.jsx` still say "Phase 1 of 21"; that is stale copy, ignore it._
+_Handoff rewritten 2026-08-09 after Phase 12, then extended the same day with §9 for Phase 12.5 (Breeth strategic memory). Everything below is verified against the actual repository (files read, tests run, `git status` captured), not the README's forward-looking text — the README and `client/src/App.jsx` still say "Phase 1 of 21"; that is stale copy, ignore it._
 
 ## 1. Project purpose & current architecture
 
@@ -19,6 +19,7 @@ scheduler (one CycleWorker per agent, owns WHEN)
          -> if publish: generatePost                              (LLM CALL #2)
          -> publishFinalPost (Post + published TopicMemory)               (0 LLM)
          -> else memory.recordDecision('deferred')                        (0 LLM)
+         -> breeth.addEpisode  OPTIONAL, off by default, never fatal      (0 LLM)
   └─ worker folds stat deltas + timing + backoff into ONE Agent update
 -> GET /api/agent/feed -> dashboard (Phase 14, not built)
 ```
@@ -57,6 +58,7 @@ server/src/
     generation/          Phase 10 FinalPost (generatePost, verifyGeneratedPost)
     publisher/           Phase 10B publishFinalPost
     memory/              Phase 11 index.js
+    breeth/              index.js — optional strategic memory       <- Phase 12.5
     agent/               runCycle.js                                       <- Phase 12
   scripts/               smoke-*.js (api, sources, llm, editorial, post-generation, publish, memory)
   utils/                 text.js, logger.js, ids.js, errors.js,
@@ -91,7 +93,7 @@ Note: `server/src/scheduler/.gitkeep` and `server/src/services/agent/.gitkeep` a
 
 `services/memory/index.js` exposes `checkRepetition(agentId, topic)` → `{gate, reason}` where gate is `BLOCKED`, `DISCOURAGED`, or `ALLOWED`, and `recordDecision(...)` for `deferred`/`published` rows. The memory layer is **advisory**: the authoritative duplicate gate is the `TopicMemory` unique index on `(agentId, normalizedTopic)`, so a race that slips past the advisory check still cannot produce a duplicate post.
 
-## 8. Phase 12 — the autonomous loop (this phase)
+## 8. Phase 12 — the autonomous loop
 
 Phase 12 added no new content capability. It added **time**: an orchestrator that runs one cycle, and a scheduler that decides when cycles happen. The split is deliberate and load-bearing:
 
@@ -107,8 +109,8 @@ Phase 12 added no new content capability. It added **time**: an orchestrator tha
 
 - `OUTCOME` = `{ PUBLISHED: 'published', DUPLICATE: 'duplicate', IDLE: 'idle', PAUSED: 'paused', FAILED: 'failed' }`.
 - `stats` is a **delta block** — `{topicsDiscovered, topicsAfterFilter, topicsRejected, topicsSelected, postsPublished, llmCalls}` — not an absolute total. The worker folds it into `$inc`.
-- `DEFAULT_SERVICES` is a frozen object of the six real collaborators (`discoverTopics`, `checkRepetition`, `evaluateCandidates`, `generatePost`, `publishFinalPost`, `recordDecision`); every one is injectable, which is why the suite needs no database and no provider.
-- `INACTIVE_STATUSES = new Set(['paused', 'removed'])` short-circuits to `OUTCOME.PAUSED` before any work. (`'removed'` is defensive — see §13.)
+- `DEFAULT_SERVICES` is a frozen object of the real collaborators (`discoverTopics`, `checkRepetition`, `evaluateCandidates`, `generatePost`, `publishFinalPost`, `recordDecision`, and — since Phase 12.5 — `breeth`); every one is injectable, which is why the suite needs no database, no provider, and no Breeth server.
+- `INACTIVE_STATUSES = new Set(['paused', 'removed'])` short-circuits to `OUTCOME.PAUSED` before any work. (`'removed'` is defensive — see §14 item 5.)
 - `CycleInputError` is thrown for a null/malformed agent, i.e. a programming error, not a runtime condition.
 
 **The LLM budget is a hard invariant, enforced by tests, not by convention:**
@@ -230,13 +232,97 @@ setScheduler(null);
 
 Order matters. Cycles stop **first**, so no worker can start a cycle against a database that is already closing; detaching the handler stops a late request from registering a worker mid-shutdown; and clearing every pending timer means nothing holds the event loop open. `startServer()` now returns `{server, shutdown, scheduler}` (was `{server, shutdown}`).
 
-## 9. Files added and modified in Phase 12
+## 9. Phase 12.5 — Breeth strategic memory (this addendum)
+
+Breeth was added as an **optional, non-authoritative strategic-memory layer**. It is not a new product feature and it does not change the agent's decisions: the authoritative memory remains MongoDB (§7). Its only job is to persist a high-value summary of what the agent decided and why, so future cycles (or a human reviewing the Breeth graph) can see cross-cycle strategic context that MongoDB's counters do not retain.
+
+The architecture boundary is unchanged and is the point of the whole phase:
+
+> **MongoDB decides (duplicates, repetition, published-topic authority, audit history, scheduler correctness). Breeth only remembers — it never decides, never blocks, and never costs an LLM call.**
+
+### 9.1 Roles
+
+| layer | authoritative for | how |
+|---|---|---|
+| MongoDB `TopicMemory` | duplicate prevention, repetition gates (`BLOCKED`/`DISCOURAGED`/`ALLOWED`), published-topic authority, audit history | unique index `(agentId, normalizedTopic)` + `checkRepetition`/`recordDecision` |
+| Breeth | **nothing** — optional strategic context only | one `POST /v1/episodes` per cycle recording the decision; `POST /v1/search` implemented but **not consulted by any decision** |
+
+### 9.2 Files added and modified
+
+**Created (source):** `server/src/services/breeth/index.js` (334 lines) — the isolated client: config gating, secret stripping, bounded HTTP (explicit `AbortController` + `setTimeout` timeout, never `AbortSignal.timeout`), episode shaping, `searchMemory`, and failure mapping. This is the **only place in the codebase** that builds an `Authorization` header or speaks to `api.thebreeth.com`.
+
+**Created (tests):** 22 tests across `server/test/breeth/service.test.js` (12) and `server/test/breeth/integration.test.js` (10).
+
+**Modified — three files, nothing else:**
+
+- `server/src/config/env.js` — a guarded `breeth` config block (every field defaulted, so an absent block cannot fail startup), warning-only validation (never a hard startup error), and a `breethEnabled: Boolean(...)` boolean in `publicConfig()`. The block is **force-disabled under the test runner** via `!process.env.NODE_TEST_CONTEXT && bool(...)` — the automated suite can never contact the real Breeth API, whatever a local `.env` says (this guard exists because a developer's `.env` with a real key once made the suite hit the live API; the lesson is encoded, not remembered).
+- `server/src/services/agent/runCycle.js` (now 442 lines) — `breeth: breethService` added to `DEFAULT_SERVICES` (DI, so the default config makes it a no-op), a `recordStrategicMemory` helper, and one call site right after `recordDeferredCandidate(...)`. `result` gains a `breeth` field that is **never** folded into `failed`, **never** added to `errors`, and **never** written to Agent state by the worker.
+- `.env.example` — exactly three new keys (§9.6), with `BREETH_API_KEY=` left empty.
+
+### 9.3 Breeth capabilities actually used
+
+Two capabilities, exactly two endpoints from the officially documented contract (`docs.thebreeth.com`), verified before any HTTP code was written:
+
+1. **Episode recording** — `POST /v1/episodes` with `{content, group_id, source_description, extract_intent}` and `Authorization: Bearer <key>`. One episode per cycle, recording the strategic decision as a prose sentence naming the persona, the event, and the topic. Four event types exist (`published`, `deferred`, `repetition_skip`, `generation_failed`); `extract_intent` is metered, so it is off unless opted in and reserved for an actual publish.
+2. **Search API availability** — `POST /v1/search` is implemented in the service and covered by tests, returning the graph edges' `fact` fields as a plain array.
+
+**Search is implemented but intentionally NOT used in the autonomous decision path.** No function anywhere in the pipeline calls `searchMemory()`. It exists as retrieval for a human or for a future phase; today the agent never consults Breeth when deciding. Nothing in this phase claims otherwise.
+
+### 9.4 Failure isolation
+
+Every Breeth failure mode — disabled, unkeyed, timeout, 401, 403, 429, 500, malformed JSON, network error — resolves to the value `{ok:false, available:false, errorCode}` instead of throwing. Because a failed Breeth write leaves `result.failed` `false` and `result.errors` `[]`, it can **never** reach the worker's `consecutiveFailures` counter and **never** triggers scheduler exponential backoff (§8.3). Publishing completes, MongoDB memory recording completes, and the post lands on the feed. A second try/catch inside `recordStrategicMemory` contains even a client that throws (pinned by test).
+
+### 9.5 Security and key handling
+
+- The key lives **only** in the server-side `Authorization` header; it is never in the URL, the body, a result, or a log line (each pinned by test).
+- Input is scrubbed **by construction** before any payload is built — URIs, bearer fragments, `key/token/password` assignments, `ck_/sk_/pk_`-prefixed tokens, and long opaque strings are all stripped — so a credential cannot reach a Breeth payload even if a future caller passed one in.
+- Breeth failure logs carry the provider's error **slug only** (`internal_error`, `quota_exceeded`, …), never provider prose, never the header, never a request body.
+- `publicConfig()` exposes a single boolean; the key never leaves the server. Zero Breeth references in `client/` and zero in `routes/`.
+- Live-key scan: the real key from a developer's `.env` appears in **0 tracked files**.
+
+### 9.6 Environment variables
+
+| variable | default | notes |
+|---|---|---|
+| `BREETH_ENABLED` | `false` | the master switch; also force-disabled under the test runner |
+| `BREETH_API_KEY` | (empty) | server-side only; needs read + write scope; admin scope not used |
+| `BREETH_TIMEOUT_MS` | `3000` | kept short so an optional write never stalls a cycle |
+
+Implementation-only (defaulted, not in `.env.example`): `BREETH_BASE_URL` → `https://api.thebreeth.com`, `BREETH_GROUP_ID` → `autonomous-ai-creator`, `BREETH_EXTRACT_INTENT` → `false`.
+
+### 9.7 Testing results (verified, not estimated)
+
+**609 passing, 0 failing** (~43 s) — the 587-test Phase 12 baseline plus the 22 new Breeth tests, with **zero regressions**. Target re-runs: scheduler 38/38, memory 52/52, breeth 22/22, config 13/13, agent 8/8. `--test-concurrency=1` remains required.
+
+The seven required cases are all pinned: disabled → zero network requests; missing key → unavailable without a request; successful episode against the mocked verified contract; timeout → abandoned and reported, never thrown; 500 → rejected with slug only (plus a 401/403/429 table); secret safety; LLM budget unchanged.
+
+**The LLM budget is unchanged — still 0 / 1 / 2, asserted against `provider.calls.length`:**
+
+| cycle shape | LLM calls | Breeth episodes |
+|---|---|---|
+| all candidates `BLOCKED` | **0** | none — `result.breeth === null` |
+| editorial skip | **1** | one `deferred` |
+| publish | **2** | one `published` |
+
+### 9.8 Current limitation (known, accepted)
+
+**Breeth is not yet consulted by the agent when making decisions.** `searchMemory()` exists and is tested, but nothing calls it: no gate, no relevance input, no repetition hint. MongoDB's `BLOCKED` verdict wins even if Breeth's graph suggests the topic is fresh — "Mongo says BLOCKED → BLOCKED" is a tested invariant, and a Breeth failure can never un-block a topic. Consulting Breeth in the decision path is deliberately left for a future phase; this phase only established the optional write path and the failure isolation.
+
+### 9.9 Enabling Breeth safely (demo procedure)
+
+1. Set the three keys in the **server** environment (never in the client, never committed): `BREETH_ENABLED=true`, `BREETH_API_KEY=<key>` (read + write scope), and the default `BREETH_TIMEOUT_MS=3000` is fine.
+2. Restart the server. Verify `publicConfig()` reports `breethEnabled: true` and that the log shows the guard line if it is off.
+3. Run one cycle. The activity log should show `Recorded a strategic memory in Breeth {"event":"published","episodeName":"ep_...","entities":N,"edges":M}`; confirm the episode in the Breeth app.
+4. To demo the failure isolation, point `BREETH_BASE_URL` at a dead host and run a cycle: the post still publishes, `failed` stays `false`, no backoff, one sanitized warning in the log.
+5. Turn it off with `BREETH_ENABLED=false` when the demo is over — the agent runs identically either way.
+
+## 10. Files added and modified in Phase 12
 
 **Created (source):**
 
 | file | lines | role |
 |---|---|---|
-| `server/src/services/agent/runCycle.js` | 362 | one cycle: WHAT |
+| `server/src/services/agent/runCycle.js` | 362 (now 442 after Phase 12.5) | one cycle: WHAT |
 | `server/src/scheduler/worker.js` | 345 | `CycleWorker` + `calculateBackoffDelay`: WHEN |
 | `server/src/scheduler/index.js` | 205 | worker registry + `get/setScheduler`: WHICH |
 | `server/src/utils/agentEvents.js` | 48 | leaf event seam (see §8.5) |
@@ -252,13 +338,13 @@ Order matters. Cycles stop **first**, so no worker can start a cycle against a d
 
 **Modified — three files, nothing else:**
 
-- `server/src/config/env.js` — `maxBackoffMs: num(process.env.AGENT_MAX_BACKOFF_MS, 30 * 60 * 1000)` added to `config.agent` (line 74) plus validation requiring an integer ≥ 1000 (line 213). The validation is **guarded** with `if (cfg.agent && cfg.agent.maxBackoffMs !== undefined)` because `test/config.test.js`'s `makeConfig` fixture omits the field.
+- `server/src/config/env.js` — `maxBackoffMs: num(process.env.AGENT_MAX_BACKOFF_MS, 30 * 60 * 1000)` added to `config.agent` (line 74) plus validation requiring an integer ≥ 1000 (line 236 after Phase 12.5 inserted the `breeth` block above it). The validation is **guarded** with `if (cfg.agent && cfg.agent.maxBackoffMs !== undefined)` because `test/config.test.js`'s `makeConfig` fixture omits the field.
 - `server/src/bootstrap.js` — scheduler start after `listen`, teardown inside the existing `shutdown`, `scheduler` added to the return value.
 - `server/src/routes/agent.js` — one `notifyAgentInitialized(agent.agentId)` call in `POST /init` wrapped in try/catch, and the router doc comment updated from "deliberately inert" to note that it hands the agent to the scheduler but still never calls the LLM and never creates a post.
 
 Phases 1–11 were **not** rewritten. No test was weakened or deleted.
 
-## 10. Testing results (verified, not estimated)
+## 11. Testing results for Phase 12 (verified, not estimated)
 
 Command, run from `server/`:
 
@@ -281,7 +367,7 @@ What the 46 new tests actually pin:
 
 Manual smoke scripts (`server/src/scripts/smoke-*.js`) still exist for Phases 1–11 and were not modified. **No Phase 12 smoke script was added** — the scheduler's behavior is time-dependent, and the fake-clock suite exercises it more precisely than a wall-clock script could.
 
-## 11. Environment variables
+## 12. Environment variables
 
 | variable | default | notes |
 |---|---|---|
@@ -300,48 +386,41 @@ Manual smoke scripts (`server/src/scripts/smoke-*.js`) still exist for Phases 1�
 | `EDITORIAL_MIN_CONFIDENCE` | `0.7` | below this, a publish decision is overridden to skip |
 | `EDITORIAL_ALLOW_SKIP` | `true` | an editor that cannot decline is not exercising judgement |
 | `MEMORY_*` | see `env.js` | `REJECTION_WINDOW_DAYS` 14, `SIMILARITY_WINDOW_DAYS` 30, `SIMILARITY_THRESHOLD` 0.6, `RECENT_LIMIT` 50, `RECENT_DAYS` 30 |
+| **`BREETH_ENABLED`** | **`false`** | **new in Phase 12.5.** Optional strategic memory (§9); also force-disabled under the test runner |
+| **`BREETH_API_KEY`** | **(empty)** | **new in Phase 12.5.** Server-side only; never committed, never exposed to client |
+| **`BREETH_TIMEOUT_MS`** | **`3000`** | **new in Phase 12.5.** How long one Breeth request may take before it is abandoned |
 
-**There is no `AGENT_CYCLE_INTERVAL_MS` variable.** `config.agent.cycleIntervalMs` is derived from `AGENT_MODE`: `demo` → **45 s**, `production` → **6 hours**. Same pipeline in both modes; only the cadence differs. `AGENT_MAX_BACKOFF_MS` is the only env-tunable timing knob Phase 12 added, and it is **not** listed in `.env.example` — see §13.
+**There is no `AGENT_CYCLE_INTERVAL_MS` variable.** `config.agent.cycleIntervalMs` is derived from `AGENT_MODE`: `demo` → **45 s**, `production` → **6 hours**. Same pipeline in both modes; only the cadence differs. `AGENT_MAX_BACKOFF_MS` is the only env-tunable timing knob Phase 12 added, and it is **not** listed in `.env.example` — see §14 item 9.
 
-## 12. Exact git state
+## 13. Exact git state
 
-Branch **`main`**. Captured with `git status --porcelain` at the time of this rewrite:
+Branch **`main`**. Phases 11 and 12 were committed as `a2aa515` after the Phase 12 rewrite of this file. Captured with `git status --short` after Phase 12.5:
 
 ```
- M server/src/bootstrap.js
+ M .env.example
  M server/src/config/env.js
- M server/src/routes/agent.js
-D  server/src/services/memory/.gitkeep
-?? PROJECT_HANDOFF.md
-?? server/src/scheduler/index.js
-?? server/src/scheduler/worker.js
-?? server/src/scripts/smoke-memory.js
-?? server/src/services/agent/runCycle.js
-?? server/src/services/memory/
-?? server/src/utils/agentEvents.js
-?? server/test/agent/
-?? server/test/fixtures/memory.js
-?? server/test/memory/
-?? server/test/scheduler/
+ M server/src/services/agent/runCycle.js
+?? server/src/services/breeth/
+?? server/test/breeth/
 ```
+
+Plus this file, `PROJECT_HANDOFF.md`, which is itself untracked.
 
 Last three commits:
 
 ```
+a2aa515 Complete Phase 11 memory and Phase 12 autonomous agent
 ac4e65a feat: improve autonomous content workflow
 42a81f6 Initial Phase
-188f857 Phase 1: project scaffold, health check, and repo structure
 ```
 
 Read this carefully before committing:
 
-- **Phases 11 and 12 are BOTH uncommitted.** The working tree mixes them. `server/src/services/memory/`, `server/src/scripts/smoke-memory.js`, `server/test/memory/`, `server/test/fixtures/memory.js`, and the staged deletion of `server/src/services/memory/.gitkeep` are **Phase 11**, and were already uncommitted before Phase 12 began.
-- `server/src/config/env.js` is modified by **both** phases: its diff contains the Phase 11 `config.memory` block *and* the Phase 12 `maxBackoffMs` line. Splitting the two phases into separate commits requires splitting that one file's diff.
-- The staged deletion (`D ` in the index) is the only staged change; everything else is unstaged or untracked.
-- `PROJECT_HANDOFF.md` — this file — is itself untracked.
-- The last commit message, "improve autonomous content workflow", predates the autonomous loop; the loop arrived in Phase 12 and is not in any commit yet.
+- **Phase 12.5 is entirely uncommitted.** The five entries above are exactly and only the Breeth work; nothing else is in flight. No `.env` is tracked (`.gitignore:7` covers it), and only `.env.example` files — with an empty `BREETH_API_KEY=` — are committed.
+- **Phases 11 and 12 are now committed together** in `a2aa515`. The tangle described in the Phase 12 handoff was resolved by committing both at once rather than splitting `env.js`'s diff.
+- The commit message `ac4e65a` "improve autonomous content workflow" predates the autonomous loop; the loop arrived in Phase 12 and is in `a2aa515`.
 
-## 13. Known limitations and loose ends
+## 14. Known limitations and loose ends
 
 Real, verified, and **deliberately not fixed** in this phase — Phase 12 was scoped to the loop, and the instruction was not to modify application logic while writing this handoff.
 
@@ -363,16 +442,17 @@ Real, verified, and **deliberately not fixed** in this phase — Phase 12 was sc
 11. **`server/src/controllers/` is still an empty `.gitkeep` directory.** Route logic lives in `routes/`. Unused since Phase 1.
 12. **No lint or typecheck.** `server/package.json` has only `start`, `dev`, `test`. Nothing enforces style or catches a typo in an unexercised branch.
 13. **The client is still the Phase 1 health-check shell.** `client/src/App.jsx` and the README both still say "Phase 1 of 21" — stale copy. The dashboard is Phase 14.
+14. **Breeth retrieval is implemented but unused (Phase 12.5).** `searchMemory()` works and is tested, but no code path calls it — the agent does not consult Breeth when deciding (§9.8). Wiring it in would be a real behavioral change and needs its own phase, since anything that reads Breeth before a decision must not become a soft dependency.
+15. **`server/src/services/breeth/.gitkeep` was never created**, so unlike `scheduler/` and `services/agent/` (item 3) this directory is consistent. Noted only so the inconsistency in item 3 is not read as a convention.
 
-## 14. Where to pick up
+## 15. Where to pick up
 
-**Phase 12 is complete and verified: 587/587 tests passing, zero regressions.** The agent runs autonomously after a single `POST /api/agent/init`, with no human prompting.
+**Phase 12 is complete and verified: 587/587 tests passing after Phase 12.** The agent runs autonomously after a single `POST /api/agent/init`, with no human prompting.
+
+**Phase 12.5 is complete and verified: 609/609 tests passing (587 baseline + 22 Breeth), zero regressions.** Breeth strategic memory is wired in as an optional, non-authoritative layer. MongoDB remains the source of truth for all decisions, and a Breeth outage can never fail a cycle.
 
 **Phase 13 has NOT been started, per the build discipline: stop after each phase and wait for go-ahead.**
 
-Before Phase 13, whoever picks this up should decide two things that Phase 12 deliberately left open:
+Before Phase 13, whoever picks this up should decide on the loose ends in §14: items 1–3 are five minutes of cleanup and remove code that actively misleads a reader; items 4–5 are small behavioral decisions (a resume path, and whether `'removed'` becomes a real status) that Phase 13 might otherwise have to guess at.
 
-- **How to commit.** Phases 11 and 12 are tangled in one working tree, and `env.js` needs its diff split if they are to be separate commits (§12).
-- **Whether to clear the loose ends in §13 first.** Items 1–3 are five minutes of cleanup and remove code that actively misleads a reader; items 4–5 are small behavioral decisions (a resume path, and whether `'removed'` becomes a real status) that Phase 13 might otherwise have to guess at.
-
-Standing constraints that still apply: do not expose or modify secrets; do not integrate Breeth; keep the ≤2-LLM-calls-per-cycle budget intact; one phase at a time.
+Standing constraints that still apply: do not expose or modify secrets; keep the ≤2-LLM-calls-per-cycle budget intact; one phase at a time.

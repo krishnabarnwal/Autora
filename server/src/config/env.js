@@ -74,6 +74,32 @@ export const config = {
     maxBackoffMs: num(process.env.AGENT_MAX_BACKOFF_MS, 30 * 60 * 1000),
   },
 
+  // Phase 12.5 — Breeth strategic memory. OPTIONAL by construction: disabled by
+  // default, and every field has a working default so an absent block can never
+  // fail startup. MongoDB (config.memory) stays authoritative for duplicate
+  // prevention and repetition; Breeth only adds cross-cycle strategic context.
+  breeth: {
+    // Both switches must be true to make a network call: the explicit opt-in and
+    // a key. Either one missing means the service reports itself unavailable.
+    //
+    // Force-disabled under the test runner, whatever the developer's .env says.
+    // The automated suite must never contact the real Breeth API — it would spend
+    // the account's quota, write junk episodes into the live memory graph, and
+    // make the tests depend on a third party's uptime. Breeth tests inject their
+    // own transport, so nothing legitimate needs this on.
+    enabled: !process.env.NODE_TEST_CONTEXT && bool(process.env.BREETH_ENABLED, false),
+    apiKey: process.env.BREETH_API_KEY || '',
+    baseUrl: process.env.BREETH_BASE_URL || 'https://api.thebreeth.com',
+    // Breeth's project-scoped partition. Not a security boundary per its docs,
+    // so it namespaces this app's episodes rather than protecting them.
+    groupId: process.env.BREETH_GROUP_ID || 'autonomous-ai-creator',
+    // Deliberately short: a cycle must never stall on an optional memory write.
+    timeoutMs: num(process.env.BREETH_TIMEOUT_MS, 3_000),
+    // Intent extraction consumes a metered credit per call, so it is opt-in and
+    // reserved for genuinely high-signal episodes (a publish decision).
+    extractIntent: bool(process.env.BREETH_EXTRACT_INTENT, false),
+  },
+
   editorial: {
     // How many Phase 7 candidates the editorial judge may consider in one call.
     // The hard ceiling still lives in candidates.js; this is the tuning knob.
@@ -216,6 +242,29 @@ export function validateConfig(cfg = config) {
     }
   }
 
+  // Phase 12.5 — Breeth strategic memory. Every finding here is a WARNING, never
+  // an error, even in production: Breeth is optional, so a misconfigured or
+  // unreachable Breeth must degrade to "disabled" rather than refuse to start.
+  // Guarded with `?` for the same reason as the blocks below (partial fixtures).
+  const breeth = cfg.breeth;
+  if (breeth?.enabled) {
+    if (!breeth.apiKey) {
+      warnings.push(
+        'BREETH_ENABLED=true but BREETH_API_KEY is not set. Strategic memory will stay disabled; '
+          + 'the agent runs normally without it.'
+      );
+    }
+    if (!Number.isInteger(breeth.timeoutMs) || breeth.timeoutMs < 250 || breeth.timeoutMs > 30_000) {
+      warnings.push(
+        `BREETH_TIMEOUT_MS should be an integer between 250 and 30000, received "${process.env.BREETH_TIMEOUT_MS}". `
+          + 'The service will fall back to its own default.'
+      );
+    }
+    if (breeth.baseUrl && !/^https?:\/\//.test(breeth.baseUrl)) {
+      warnings.push('BREETH_BASE_URL must start with http:// or https://; strategic memory will stay disabled.');
+    }
+  }
+
   // Phase 11 memory knobs. Guarded with `?` because the minimal config fixture
   // in the tests predates this block; the real config always populates it with
   // valid defaults, so this only ever fires on a genuinely bad env override.
@@ -251,5 +300,8 @@ export function publicConfig() {
     llmModel: config.llm.model,
     llmConfigured: Boolean(config.llm.apiKey),
     databaseConfigured: Boolean(config.db.mongoUri),
+    // Phase 12.5 — whether strategic memory is live. A boolean only: the key
+    // itself never leaves the server, and this view is logged and HTTP-exposed.
+    breethEnabled: Boolean(config.breeth?.enabled && config.breeth?.apiKey),
   };
 }
