@@ -92,20 +92,27 @@ export function parseAgentId(value) {
 }
 
 /**
+ * Shared bounded-integer rule for every `limit` query parameter.
+ *
+ * One implementation means the feed and the dashboard endpoints reject the same
+ * malformed input the same way, with the same `limit_invalid` code.
+ */
+function parseLimit(value, { fallback, max }) {
+  if (value === undefined) return fallback;
+  const limit = Number(value);
+  if (!Number.isInteger(limit) || limit < 1 || limit > max) {
+    throw badRequest('limit_invalid', `limit must be an integer between 1 and ${max}.`);
+  }
+  return limit;
+}
+
+/**
  * Bounded pagination for the feed. The default is generous enough that a normal
  * evaluation never paginates, while `before` keeps older posts reachable so the
  * "previously returned posts remain available" guarantee still holds.
  */
 export function parseFeedPaging(query = {}) {
-  const paging = { limit: 200 };
-
-  if (query.limit !== undefined) {
-    const limit = Number(query.limit);
-    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
-      throw badRequest('limit_invalid', 'limit must be an integer between 1 and 500.');
-    }
-    paging.limit = limit;
-  }
+  const paging = { limit: parseLimit(query.limit, { fallback: 200, max: 500 }) };
 
   if (query.before !== undefined) {
     const before = new Date(query.before);
@@ -116,4 +123,52 @@ export function parseFeedPaging(query = {}) {
   }
 
   return paging;
+}
+
+/**
+ * Paging for GET /api/agent. A dashboard lists a handful of agents, so the cap
+ * is deliberately tighter than the feed's.
+ */
+export function parseAgentListQuery(query = {}) {
+  return { limit: parseLimit(query.limit, { fallback: 25, max: 100 }) };
+}
+
+/**
+ * Query for GET /api/agent/:agentId/activity.
+ *
+ * `scope=all` widens the read to the process-wide activity buffer (startup,
+ * scheduler, and source events that carry no agentId) so the dashboard can show
+ * system health from the same source of truth.
+ */
+export function parseActivityQuery(query = {}) {
+  const scope = query.scope === undefined ? 'agent' : query.scope;
+  if (scope !== 'agent' && scope !== 'all') {
+    throw badRequest('scope_invalid', "scope must be either 'agent' or 'all'.");
+  }
+  return { limit: parseLimit(query.limit, { fallback: 100, max: 300 }), scope };
+}
+
+/**
+ * Query for GET /api/agent/:agentId/memory. `decision` is validated by the
+ * memory service against its own enum, so it is passed through untouched.
+ */
+export function parseMemoryQuery(query = {}) {
+  const parsed = { limit: parseLimit(query.limit, { fallback: 50, max: 200 }) };
+
+  if (query.days !== undefined) {
+    const days = Number(query.days);
+    if (!Number.isInteger(days) || days < 1 || days > 365) {
+      throw badRequest('days_invalid', 'days must be an integer between 1 and 365.');
+    }
+    parsed.days = days;
+  }
+
+  if (query.decision !== undefined) {
+    if (typeof query.decision !== 'string' || !query.decision.trim()) {
+      throw badRequest('decision_invalid', 'decision must be a non-empty string.');
+    }
+    parsed.decision = query.decision.trim();
+  }
+
+  return parsed;
 }
