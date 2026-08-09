@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { Agent, Post, personaKeyFor } from '../models/index.js';
+import { notifyAgentInitialized } from '../utils/agentEvents.js';
 import { notFound } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import { parseAgentId, parseFeedPaging, parseInitBody } from './validators.js';
@@ -9,10 +10,11 @@ const log = logger('API');
 /**
  * Public agent API: the two endpoints named in the problem statement.
  *
- * Deliberately inert: this router only reads and writes MongoDB. It never calls
- * the LLM, never fetches an external source, and never creates a post. All
- * content creation belongs to the autonomous worker (Phase 12), so the feed
- * stays a pure read of what the agent already decided to publish.
+ * Still inert with respect to content: these handlers read and write MongoDB and
+ * hand the agent to the scheduler, but they never call the LLM, never fetch an
+ * external source, and never create a post. All content creation happens in the
+ * autonomous worker's own cycle, so the feed stays a pure read of what the agent
+ * already decided to publish and POST /init returns immediately.
  *
  * Express 5 forwards rejected promises to the error handler in app.js, so
  * handlers can throw validation errors directly.
@@ -55,6 +57,23 @@ export function agentRouter() {
       persona: `${agent.persona.name} / ${agent.persona.domain}`,
       status: agent.status,
     });
+
+    // Announce the agent so the autonomous scheduler can begin its cycles. The
+    // route deliberately does not import the scheduler — it notifies a leaf
+    // event module, and bootstrap wires that to scheduler.register — so the HTTP
+    // layer keeps no dependency on the worker or the LLM stack. Registration is
+    // idempotent on the scheduler's side, so a repeat init never starts a second
+    // loop. With nothing listening (every test that does not boot a server) this
+    // is a no-op, which keeps the endpoint inert and instant. A failure here
+    // must never fail the request: the agent is persisted, and resumeAll() would
+    // pick it up on the next restart regardless.
+    try {
+      notifyAgentInitialized(agent.agentId);
+    } catch (err) {
+      log.error('Could not hand the agent to the autonomous scheduler', {
+        agentId: agent.agentId, code: err?.code,
+      });
+    }
 
     // Exactly the contract shape. Status distinguishes create from reuse.
     res.status(created ? 201 : 200).json({ agentId: agent.agentId });

@@ -2,6 +2,9 @@ import { createApp } from './app.js';
 import { config, publicConfig, validateConfig } from './config/env.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { syncIndexes } from './models/index.js';
+import { getLlmProvider } from './services/llm/index.js';
+import { Scheduler, setScheduler } from './scheduler/index.js';
+import { setAgentInitializedHandler } from './utils/agentEvents.js';
 import { logger } from './utils/logger.js';
 
 const log = logger('SERVER');
@@ -33,6 +36,22 @@ export async function startServer() {
 
   log.info(`Listening on http://localhost:${config.port}`, publicConfig());
 
+  // The autonomous loop starts only here, in the real server bootstrap. Tests
+  // build the app directly via createApp(), so they never register a worker and
+  // never arm a timer.
+  const scheduler = new Scheduler({ provider: getLlmProvider() });
+  setScheduler(scheduler);
+  // Newly created agents begin cycling immediately: the init route announces
+  // them, and this is the only place that connects that announcement to the
+  // scheduler, keeping the HTTP layer free of any scheduler dependency.
+  setAgentInitializedHandler((agentId) => scheduler.register(agentId));
+  const resumed = await scheduler.resumeAll();
+  log.info('Autonomous scheduler started', {
+    agents: resumed,
+    cycleIntervalMs: config.agent.cycleIntervalMs,
+    maxBackoffMs: config.agent.maxBackoffMs,
+  });
+
   let shuttingDown = false;
   const shutdown = async (signal) => {
     if (shuttingDown) return;
@@ -45,6 +64,14 @@ export async function startServer() {
       process.exit(1);
     }, 10_000);
     failsafe.unref();
+
+    // Stop the cycles first: a worker must never start a cycle against a
+    // database that is already closing. stopAll clears every pending timer, so
+    // nothing is left holding the event loop open, and detaching the init hook
+    // stops a late request from registering a worker mid-shutdown.
+    setAgentInitializedHandler(null);
+    scheduler.stopAll();
+    setScheduler(null);
 
     try {
       await new Promise((resolve) => server.close(resolve));
@@ -60,5 +87,5 @@ export async function startServer() {
 
   // Signal handling belongs to the process entrypoint (server.js), not here,
   // so tests can call shutdown() directly without touching process state.
-  return { server, shutdown };
+  return { server, shutdown, scheduler };
 }

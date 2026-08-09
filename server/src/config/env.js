@@ -66,6 +66,12 @@ export const config = {
     mode: agentMode,
     // Same pipeline in both modes; only the cadence differs.
     cycleIntervalMs: agentMode === 'demo' ? 45_000 : 6 * 60 * 60 * 1000,
+    // Phase 12 — exponential-backoff ceiling. After a failed cycle the worker
+    // retries at cycleIntervalMs, then 2×, 4×, … doubling each consecutive
+    // failure, capped here so a persistently broken provider or database is
+    // retried at most this often rather than hammered. Reset on the first
+    // success. Deliberately allowed to exceed cycleIntervalMs.
+    maxBackoffMs: num(process.env.AGENT_MAX_BACKOFF_MS, 30 * 60 * 1000),
   },
 
   editorial: {
@@ -78,6 +84,25 @@ export const config = {
     // Whether the agent is permitted to publish nothing this cycle. True by
     // default: an editor that cannot decline is not exercising judgement.
     allowSkip: bool(process.env.EDITORIAL_ALLOW_SKIP, true),
+  },
+
+  // Phase 11 — topic memory + repetition detection. All deterministic; no LLM.
+  // Every knob is also injectable per call, so tests never touch env.
+  memory: {
+    // A candidate the agent *rejected* this recently is discouraged rather than
+    // re-judged (a fresh rejection would usually just cost another LLM call).
+    // Older rejections fall outside the window and become allowed again.
+    rejectionWindowDays: num(process.env.MEMORY_REJECTION_WINDOW_DAYS, 14),
+    // How far back the fuzzy similarity pass looks over prior decisions.
+    similarityWindowDays: num(process.env.MEMORY_SIMILARITY_WINDOW_DAYS, 30),
+    // Token-overlap floor for "essentially the same topic". Deliberately a touch
+    // lower than dedupe's 0.62 batch threshold: memory compares across cycles,
+    // and a heuristic hit here only *discourages*, it never hard-blocks.
+    similarityThreshold: float(process.env.MEMORY_SIMILARITY_THRESHOLD, 0.6),
+    // Default page size for getRecentMemory; maxRecentLimit is the hard ceiling
+    // no caller can exceed, so memory retrieval is never unbounded.
+    recentLimit: num(process.env.MEMORY_RECENT_LIMIT, 50),
+    recentDays: num(process.env.MEMORY_RECENT_DAYS, 30),
   },
 };
 
@@ -177,6 +202,34 @@ export function validateConfig(cfg = config) {
       'EDITORIAL_ALLOW_SKIP=false forces a publish every cycle. The agent will fall back to its '
         + 'top-ranked candidate when it judges that nothing is worth publishing.'
     );
+  }
+
+  // Phase 12 backoff ceiling. Guarded with `!== undefined` because the minimal
+  // config fixture in config.test.js predates this field; the real config always
+  // populates it, so this only fires on a genuinely bad env override.
+  if (cfg.agent && cfg.agent.maxBackoffMs !== undefined) {
+    if (!Number.isInteger(cfg.agent.maxBackoffMs) || cfg.agent.maxBackoffMs < 1000) {
+      errors.push(
+        `AGENT_MAX_BACKOFF_MS must be an integer of at least 1000 (one second), received "${process.env.AGENT_MAX_BACKOFF_MS}". ` +
+          'It is the ceiling on exponential retry backoff after a failed cycle.'
+      );
+    }
+  }
+
+  // Phase 11 memory knobs. Guarded with `?` because the minimal config fixture
+  // in the tests predates this block; the real config always populates it with
+  // valid defaults, so this only ever fires on a genuinely bad env override.
+  const memory = cfg.memory;
+  if (memory) {
+    for (const field of ['rejectionWindowDays', 'similarityWindowDays', 'recentDays', 'recentLimit']) {
+      const value = memory[field];
+      if (!Number.isInteger(value) || value < 1) {
+        errors.push(`MEMORY_${field.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()} must be a positive integer, received "${value}"`);
+      }
+    }
+    if (!(memory.similarityThreshold >= 0 && memory.similarityThreshold <= 1)) {
+      errors.push(`MEMORY_SIMILARITY_THRESHOLD must be between 0 and 1, received "${memory.similarityThreshold}"`);
+    }
   }
 
   if (errors.length) {
