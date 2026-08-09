@@ -16,12 +16,21 @@ import { runWithRetries } from './retry.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 /**
+ * Fallback when LLM_MODEL is unset. LLM_MODEL remains the source of truth; this
+ * is only what an unconfigured key gets.
+ *
  * Pinned rather than an alias like `gemini-flash-latest`: a 48-hour evaluation
  * run should not have the model shift under it. Verified callable by the live
  * smoke check — note that ListModels advertises models the account cannot
  * actually use, so "it appears in the list" is not evidence it works.
+ *
+ * On the id itself: Google retires model ids for new keys and allocates free-tier
+ * quota per model, so "callable" and "has quota" are separate questions and both
+ * change over time. `gemini-2.5-flash` now 404s for new keys, and the 2.0 family
+ * returns a free-tier limit of 0. This id was confirmed against both — HTTP 200
+ * on a live generateContent probe — at the time it was set.
  */
-export const DEFAULT_MODEL = 'gemini-3.5-flash';
+export const DEFAULT_MODEL = 'gemini-3.6-flash';
 export const DEFAULT_TIMEOUT_MS = 30_000;
 /** One retry: transport blips are common, and a stalled cycle is worse than a skipped one. */
 export const DEFAULT_RETRIES = 1;

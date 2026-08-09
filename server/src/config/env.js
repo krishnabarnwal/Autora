@@ -15,6 +15,22 @@ function num(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+/**
+ * Integer override that distinguishes "absent" from "present but invalid".
+ *
+ * `num` silently falls back on garbage, which is fine for a tuning knob but
+ * wrong for the cycle cadence: a typo there would quietly restore the fast demo
+ * default and spend a day's provider quota in a quarter of an hour. Returning
+ * NaN for a present-but-unparseable value lets validateConfig reject it by name
+ * instead. Accepts only a plain positive integer — no `2.5`, no `1e3`, no units.
+ */
+function strictNum(value, fallback) {
+  if (value === undefined || value === '') return fallback;
+  const trimmed = String(value).trim();
+  if (!/^\d+$/.test(trimmed)) return NaN;
+  return Number.parseInt(trimmed, 10);
+}
+
 function float(value, fallback) {
   const parsed = Number.parseFloat(value ?? '');
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -59,13 +75,30 @@ export const config = {
   llm: {
     provider: process.env.LLM_PROVIDER || 'gemini',
     apiKey: process.env.LLM_API_KEY || '',
-    model: process.env.LLM_MODEL || 'gemini-3.5-flash',
+    // LLM_MODEL is the source of truth; this is only the fallback for a key that
+    // has none set. See DEFAULT_MODEL in services/llm/geminiProvider.js for why
+    // this particular id, and why it is pinned rather than an alias.
+    model: process.env.LLM_MODEL || 'gemini-3.6-flash',
   },
 
   agent: {
     mode: agentMode,
     // Same pipeline in both modes; only the cadence differs.
-    cycleIntervalMs: agentMode === 'demo' ? 45_000 : 6 * 60 * 60 * 1000,
+    //
+    // AGENT_CYCLE_INTERVAL_MS overrides the mode default when set. It exists
+    // because the mode defaults are tuned for visibility, not for provider
+    // quota: at 45s the demo asks for ~1,920 editorial calls a day, and a
+    // free-tier Gemini key allows 20 per model per day. Absent the variable the
+    // behaviour is byte-for-byte what it was — 45s in demo, 6h in production —
+    // so nothing that relies on the mode default changes. A present-but-invalid
+    // value is rejected by validateConfig rather than silently ignored, because
+    // silently restoring 45s is exactly the failure this knob exists to prevent.
+    cycleIntervalMs: strictNum(
+      process.env.AGENT_CYCLE_INTERVAL_MS,
+      agentMode === 'demo' ? 45_000 : 6 * 60 * 60 * 1000
+    ),
+    /** True when the cadence came from the environment rather than the mode. */
+    cycleIntervalFromEnv: Boolean(process.env.AGENT_CYCLE_INTERVAL_MS),
     // Phase 12 — exponential-backoff ceiling. After a failed cycle the worker
     // retries at cycleIntervalMs, then 2×, 4×, … doubling each consecutive
     // failure, capped here so a persistently broken provider or database is
@@ -228,6 +261,21 @@ export function validateConfig(cfg = config) {
       'EDITORIAL_ALLOW_SKIP=false forces a publish every cycle. The agent will fall back to its '
         + 'top-ranked candidate when it judges that nothing is worth publishing.'
     );
+  }
+
+  // The autonomous cadence. Guarded with `!== undefined` for the same reason as
+  // the backoff block below: the minimal fixture in config.test.js predates the
+  // field. NaN is the specific signal strictNum emits for a present-but-garbage
+  // AGENT_CYCLE_INTERVAL_MS, and it must be an error rather than a fallback —
+  // quietly reverting to the 45s demo default would re-create the quota
+  // exhaustion this variable exists to fix, with no indication anything is wrong.
+  if (cfg.agent && cfg.agent.cycleIntervalMs !== undefined) {
+    if (!Number.isInteger(cfg.agent.cycleIntervalMs) || cfg.agent.cycleIntervalMs < 1000) {
+      errors.push(
+        `AGENT_CYCLE_INTERVAL_MS must be a positive integer of at least 1000 (one second), received "${process.env.AGENT_CYCLE_INTERVAL_MS}". ` +
+          'Leave it unset to use the mode default (45000 in demo, 21600000 in production).'
+      );
+    }
   }
 
   // Phase 12 backoff ceiling. Guarded with `!== undefined` because the minimal

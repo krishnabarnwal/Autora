@@ -133,6 +133,34 @@ function buildResult({
   };
 }
 
+/**
+ * How many LLM calls this cycle actually made.
+ *
+ * Read from what the services report, not from the provider object. `provider`
+ * is an optional test seam, and only the mock exposes a `.calls` array — against
+ * real Gemini it is `undefined`, so probing it made every production cycle report
+ * zero while the editorial call was demonstrably happening.
+ *
+ * The unit is a LOGICAL call, matching the existing semantics everywhere else in
+ * the project: editorial and generation each increment their own `llmCalls` once
+ * per call they choose to make, and separately expose `llmAttempts` for transport
+ * attempts including retries. A single editorial call that retried a 429 is one
+ * call and two attempts. `stats.llmCalls` is the former — it answers "how many
+ * times did the agent decide to consult the model", which is what the two-calls-
+ * per-cycle budget is about and what the dashboard means by "LLM calls". The mock
+ * agrees by construction: it pushes to `.calls` once per logical call, outside
+ * runWithRetries.
+ *
+ * @param {object|null} editor an editorial result, if the cycle got that far.
+ * @param {object|null} generation a generation result, if one was attempted.
+ * @returns {number}
+ */
+function countLlmCalls(editor, generation) {
+  const editorial = Number.isFinite(editor?.llmCalls) ? editor.llmCalls : 0;
+  const generated = Number.isFinite(generation?.llmCalls) ? generation.llmCalls : 0;
+  return editorial + generated;
+}
+
 /** Empty stat block for a cycle that discovered candidates but published none. */
 function statBlock({ discovered = 0, afterFilter = 0, rejected = 0, selected = 0, published = 0, llmCalls = 0 }) {
   return {
@@ -273,7 +301,11 @@ export async function runCycle(agent, options = {}) {
   }
 
   const shared = { agentId, now };
+  // Only the mock provider exposes `.calls`; against real Gemini this stays 0.
+  // Kept as the direct transport probe the budget tests read, with countLlmCalls
+  // as the provider-agnostic fallback below.
   const providerCallsBefore = provider?.calls?.length ?? 0;
+  const hasCallSeam = Array.isArray(provider?.calls);
   const errors = [];
 
   // --- Discover (0 LLM calls) -------------------------------------------------
@@ -334,6 +366,9 @@ export async function runCycle(agent, options = {}) {
     log.error('Editorial judgement threw; the cycle counts as failed', {
       agentId, name: err?.name, code: err?.code,
     });
+    // A throw here means a caller bug, not a spent call: every real editorial
+    // failure (including a 429) returns a skip-shaped result instead. There is no
+    // result to read a count from, so the transport seam is all we have.
     return buildResult({
       agentId, cycleId, outcome: OUTCOME.FAILED, failed: true,
       providerCalls: (provider?.calls?.length ?? 0) - providerCallsBefore,
@@ -415,7 +450,14 @@ export async function runCycle(agent, options = {}) {
     cycleId,
   });
 
-  const providerCalls = (provider?.calls?.length ?? 0) - providerCallsBefore;
+  // What the services report they asked the model for — the dashboard metric.
+  // Works for every provider, including real Gemini, which has no `.calls` array.
+  const llmCalls = countLlmCalls(editor, generation_);
+  // The transport probe stays exactly what it was where it exists (the mock), and
+  // falls back to the logical count where it does not, so it is never a silent 0.
+  const providerCalls = hasCallSeam
+    ? provider.calls.length - providerCallsBefore
+    : llmCalls;
   const published = publisher?.created === true;
 
   return buildResult({
@@ -435,7 +477,7 @@ export async function runCycle(agent, options = {}) {
       rejected: blockedCount,
       selected: editor.decision === DECISIONS.PUBLISH ? 1 : 0,
       published: published ? 1 : 0,
-      llmCalls: providerCalls,
+      llmCalls,
     }),
     errors,
   });

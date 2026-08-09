@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startTestDb, stopTestDb, clearTestDb } from '../helpers/db.js';
 import { Agent } from '../../src/models/index.js';
+import { config } from '../../src/config/env.js';
 
 const SENTINEL = {
   persona: {
@@ -24,7 +25,10 @@ test('agent: creates with generated agentId and ISO createdAt', async () => {
   assert.equal(agent.persona.domain, 'AI Security');
   assert.equal(agent.status, 'initializing');
   assert.equal(agent.configuration.mode, 'demo');
-  assert.equal(agent.configuration.cycleIntervalMs, 45_000);
+  // The schema default is `() => config.agent.cycleIntervalMs`, so that is what
+  // this asserts. A literal here would instead be asserting the developer's
+  // AGENT_CYCLE_INTERVAL_MS, and would fail on any machine that sets it.
+  assert.equal(agent.configuration.cycleIntervalMs, config.agent.cycleIntervalMs);
   assert.equal(agent.stats.postsPublished, 0);
 
   const createdAt = new Date(agent.createdAt.toISOString());
