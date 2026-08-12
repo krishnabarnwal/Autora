@@ -61,7 +61,7 @@ const agentSchema = new Schema(
     status: { type: String, enum: AGENT_STATUS, default: 'initializing', index: true },
 
     configuration: {
-      // Persisted so a restart resumes the agent on the cadence it was created
+      // Persisted so a restart resumes the agent on the mode it was created
       // with, rather than whatever the current env happens to say.
       mode: {
         type: String,
@@ -69,6 +69,10 @@ const agentSchema = new Schema(
         required: true,
         default: () => config.agent.mode,
       },
+      // The default seeds this at creation, but it is NOT frozen: CycleWorker
+      // rewrites it each cycle with the cadence it is actually sleeping on, so
+      // the value this API reports can never drift from the running schedule.
+      // See _buildUpdate in scheduler/worker.js for why env wins here.
       cycleIntervalMs: {
         type: Number,
         required: true,

@@ -43,6 +43,24 @@ test('memory: publishing records a published TopicMemory linked to the post', as
   assert.deepEqual(memory.sourceUrls, [CANDIDATE.url]);
   assert.ok(memory.reason && memory.reason.length > 0, 'the decision reason is recorded');
   assert.ok(Array.isArray(memory.keywords) && memory.keywords.length > 0);
+  assert.deepEqual(
+    [...memory.reasons],
+    ['Proof-of-concept and affected versions are described in the summary.'],
+    "the editor's own evidence is carried through verbatim as structured reasoning"
+  );
+});
+
+test('memory: a publish with no editorial evidence leaves reasons unset', async () => {
+  // The editor is not obliged to produce evidence (the local/precheck paths
+  // return evidence: []). Nothing may be synthesised to fill the gap — an
+  // invented bullet would be a fabricated audit trail attributed to the agent.
+  const agent = await seedAgent();
+  const decision = publishDecisionResult({ evidence: [] });
+  await publishFinalPost(buildFinalPost(), buildContext({ agentId: agent.agentId, decision }));
+
+  const memory = await TopicMemory.findOne({ agentId: agent.agentId, decision: 'published' }).lean();
+  assert.equal(memory.reasons, undefined, 'absent, not an empty array');
+  assert.ok(memory.reason && memory.reason.length > 0, 'the prose reason is still recorded');
 });
 
 test('memory: a repeated publish keeps exactly one published row (atomic upsert)', async () => {

@@ -273,7 +273,7 @@ test('memory: returns the compact decision view plus totals by outcome', async (
   const published = res.body.memory.find((m) => m.decision === 'published');
   assert.deepEqual(
     Object.keys(published).sort(),
-    ['createdAt', 'cycleId', 'decision', 'normalizedTopic', 'postId', 'rejectionCategory', 'score', 'sources', 'topic'],
+    ['createdAt', 'cycleId', 'decision', 'normalizedTopic', 'postId', 'reason', 'reasons', 'rejectionCategory', 'score', 'sources', 'topic'],
     'memory rows must be the memory service view, not raw documents'
   );
   assert.equal(published.score, 82);

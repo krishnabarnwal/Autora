@@ -38,7 +38,7 @@
  * "published" memory pointing at a post that does not exist, which is the lie
  * this layer most needs to avoid.
  */
-import { Agent, Post, TopicMemory } from '../../models/index.js';
+import { Agent, Post, TopicMemory, sanitizeReasons } from '../../models/index.js';
 import { normalizeTopic, extractKeywords } from '../../utils/text.js';
 import { logger } from '../../utils/logger.js';
 
@@ -222,6 +222,16 @@ function readContext(context) {
   const reasonSource = String(context.reason ?? decision.reason ?? rationaleSource).trim();
   const reason = (reasonSource || rationaleSource).slice(0, MAX_REASON);
 
+  // The structured "why this one". `decision.evidence` is the editor's own
+  // answer to "what in the provided material supports this" (see the editorial
+  // prompt), so it is the one array that genuinely explains the *published*
+  // choice. decision.rejectionReasons is deliberately NOT used here: the prompt
+  // defines it as why the OTHER candidates were passed over, and filing it under
+  // this post's reasoning would attribute an argument to the editor that it
+  // never made about this topic. Absent when the editor produced none — the
+  // mock/local paths return evidence: [] — and never invented.
+  const reasons = sanitizeReasons(context.reasons ?? decision.evidence);
+
   const keywords = pickKeywords(context, candidate, `${topic} ${reason}`);
 
   return {
@@ -233,6 +243,7 @@ function readContext(context) {
     normalizedTopic,
     rationale,
     reason,
+    reasons,
     keywords,
     score: toScore(context.score, decision.score, decision.confidence),
     cycleId: context.cycleId ? String(context.cycleId) : null,
@@ -401,6 +412,10 @@ async function recordPublishedMemory({ ctx, sources, postId, created }) {
     postId,
     cycleId: ctx.cycleId,
   };
+  // Carried only when the editor actually produced evidence. Setting the key to
+  // undefined relies on driver-specific stripping, and setting it to null would
+  // let a reconcile blank out a good list, so an absent list means an absent key.
+  if (ctx.reasons) authored.reasons = ctx.reasons;
   const update = created ? { $set: authored } : { $setOnInsert: authored };
 
   try {

@@ -58,6 +58,7 @@ export async function seedMemory(agentId, {
   topic,
   decision = 'rejected',
   reason = 'Seeded for a memory test.',
+  reasons,
   rejectionCategory = decision === 'rejected' ? 'low_novelty' : null,
   keywords = [],
   sourceUrls = [],
@@ -69,6 +70,12 @@ export async function seedMemory(agentId, {
   const doc = await TopicMemory.create({
     agentId, topic, decision, reason, rejectionCategory, keywords, sourceUrls, score, cycleId, postId,
   });
+  // Structured reasons are written in a separate update so the field stays
+  // absent on rows seeded without them (mirroring how production rows written
+  // before structured reasoning existed genuinely lack the field).
+  if (reasons) {
+    await TopicMemory.updateOne({ _id: doc._id }, { $set: { reasons } });
+  }
   if (ageDays > 0) {
     const backdated = new Date(Date.now() - ageDays * DAY_MS);
     await TopicMemory.collection.updateOne({ _id: doc._id }, { $set: { createdAt: backdated } });

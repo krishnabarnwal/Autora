@@ -94,16 +94,34 @@ test('getRecentMemory returns a bounded view shape, not a raw document', async (
   await seedMemory(agent.agentId, {
     topic: 'Shape probe about observability', decision: 'rejected',
     rejectionCategory: 'low_novelty', sourceUrls: ['https://example.org/a'], score: 42, ageDays: 1,
+    reasons: ['Sourcing too weak to write about responsibly.'],
   });
 
   const [row] = await getRecentMemory(agent.agentId);
   assert.deepEqual(
     Object.keys(row).sort(),
-    ['createdAt', 'cycleId', 'decision', 'normalizedTopic', 'postId', 'rejectionCategory', 'score', 'sources', 'topic'].sort()
+    ['createdAt', 'cycleId', 'decision', 'normalizedTopic', 'postId', 'reason', 'reasons', 'rejectionCategory', 'score', 'sources', 'topic'].sort()
   );
   assert.equal(typeof row.createdAt, 'string', 'createdAt is an ISO string, not a Date');
   assert.equal(row._id, undefined, 'no raw _id leaks');
   assert.ok(Array.isArray(row.sources));
+  assert.deepEqual(row.reasons, ['Sourcing too weak to write about responsibly.']);
+  assert.equal(row.reason, 'Seeded for a memory test.');
+});
+
+test('getRecentMemory reports absent structured reasons as null, not []', async () => {
+  // A row written before structured reasoning existed — the field is genuinely
+  // absent on the document, and the view must not manufacture an empty list
+  // that would read as "the editor enumerated nothing".
+  const agent = await seedAgent();
+  await seedMemory(agent.agentId, {
+    topic: 'Legacy shape probe about kernels', decision: 'deferred',
+    reason: 'Parked for a later cycle.', ageDays: 2,
+  });
+
+  const [row] = await getRecentMemory(agent.agentId);
+  assert.equal(row.reason, 'Parked for a later cycle.', 'the recorded prose is always present');
+  assert.equal(row.reasons, null, 'absent stays absent');
 });
 
 test('getRecentMemory is empty (not an error) for an agent with no history', async () => {

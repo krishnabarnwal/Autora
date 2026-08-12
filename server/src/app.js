@@ -38,7 +38,7 @@ export function createApp() {
     });
   });
 
-  // Public agent API (the problem statement contract).
+  // Public agent API.
   app.use('/api/agent', agentRouter());
 
   app.use((req, res) => {

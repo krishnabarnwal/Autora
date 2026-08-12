@@ -1,6 +1,12 @@
 import { Agent, AGENT_STATUS, personaKeyFor } from './Agent.js';
 import { Post } from './Post.js';
-import { TopicMemory, TOPIC_DECISIONS, REJECTION_REASONS } from './TopicMemory.js';
+import { TopicMemory, TOPIC_DECISIONS, REJECTION_REASONS, sanitizeReasons } from './TopicMemory.js';
+import {
+  CycleRun,
+  CYCLE_RUN_STATUS,
+  CYCLE_RUN_OUTCOMES,
+  CYCLE_RUN_DECISIONS,
+} from './CycleRun.js';
 import { logger } from '../utils/logger.js';
 
 const log = logger('DB');
@@ -9,9 +15,14 @@ export {
   Agent,
   Post,
   TopicMemory,
+  CycleRun,
   AGENT_STATUS,
   TOPIC_DECISIONS,
   REJECTION_REASONS,
+  CYCLE_RUN_STATUS,
+  CYCLE_RUN_OUTCOMES,
+  CYCLE_RUN_DECISIONS,
+  sanitizeReasons,
   personaKeyFor,
 };
 
@@ -23,7 +34,7 @@ export {
  * violates) surfaces at startup instead of mid-cycle.
  */
 export async function syncIndexes() {
-  const models = [Agent, Post, TopicMemory];
+  const models = [Agent, Post, TopicMemory, CycleRun];
   const created = [];
   for (const Model of models) {
     try {

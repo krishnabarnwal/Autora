@@ -1,12 +1,13 @@
 {
-  "name": "autonomous-ai-creator-client",
+  "name": "autora-client",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\""
   },
   "dependencies": {
     "react": "19.2.8",
