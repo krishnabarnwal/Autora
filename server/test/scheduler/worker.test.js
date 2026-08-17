@@ -103,12 +103,18 @@ const pausedResult = () => ({
  * Build a worker wired to a fake clock and recording reload/persist/runCycle.
  * `runResults` may be a single result, an array consumed per cycle (last one
  * repeats), or a function (agent) => result.
+ *
+ * The cycle-history seams are recorded too, and `newId` is deterministic
+ * (`cyc_1`, `cyc_2`, …) so a test can name the row a cycle should have written
+ * without reaching for a UUID.
  */
 function makeWorker({ runResults = successResult(), agent, reloadFn, persistFn, options } = {}) {
   const clock = new FakeClock();
   const persistCalls = [];
   const reloadCalls = [];
   const runCalls = [];
+  const opened = [];
+  const closed = [];
   const theAgent = agent === undefined
     ? { agentId: AGENT_ID, status: 'autonomous', persona: { name: 'W', domain: 'D' } }
     : agent;
@@ -124,6 +130,8 @@ function makeWorker({ runResults = successResult(), agent, reloadFn, persistFn, 
     return runResults;
   };
 
+  let ids = 0;
+
   const worker = new CycleWorker(AGENT_ID, {
     now: clock.now,
     setTimer: clock.setTimer,
@@ -131,13 +139,16 @@ function makeWorker({ runResults = successResult(), agent, reloadFn, persistFn, 
     cycleIntervalMs: INTERVAL,
     maxBackoffMs: MAX_BACKOFF,
     logger: silent,
+    newId: () => `cyc_${++ids}`,
     reload: reloadFn ?? (async (id) => { reloadCalls.push(id); return theAgent; }),
     persist: persistFn ?? (async (id, update) => { persistCalls.push({ id, update }); }),
+    openCycleRun: async (record) => { opened.push(record); },
+    closeCycleRun: async (cycleId, update) => { closed.push({ cycleId, update }); },
     runCycleFn: async (a, opts) => { runCalls.push({ a, opts }); return nextResult(a); },
     ...options,
   });
 
-  return { worker, clock, persistCalls, reloadCalls, runCalls };
+  return { worker, clock, persistCalls, reloadCalls, runCalls, opened, closed };
 }
 
 // --- The pure backoff function: a timer-free truth table ----------------------
@@ -426,6 +437,72 @@ test('a transient reload failure backs off and retries without writing stats', a
   await clock.advance(INTERVAL); // second attempt: reload works, cycle succeeds
   assert.equal(runCalls.length, 1);
   assert.equal(worker.consecutiveFailures, 0, 'recovery resets the backoff');
+
+  worker.stop();
+});
+
+// --- Observability: the completion marker names the cycle it closes -----------
+//
+// 'Cycle started' (runCycle) and 'Cycle complete' (here) bracket one cycle's
+// work in the activity buffer. The dashboard's cycle view reads the pair to know
+// where a cycle began and ended; without a shared id the only way to match them
+// is by position, which misattributes as soon as two agents interleave.
+
+/** A logger that keeps what it was told, so a payload can be asserted. */
+function capturingLogger() {
+  const entries = [];
+  const push = (level) => (message, meta) => entries.push({ level, message, meta });
+  return {
+    entries,
+    debug: push('debug'), info: push('info'), warn: push('warn'), error: push('error'),
+  };
+}
+
+test('Cycle complete carries the cycleId of the cycle it closes', async () => {
+  const logger = capturingLogger();
+  const { worker, clock, runCalls, opened } = makeWorker({
+    options: { logger, newId: () => 'c_worker_0001' },
+  });
+
+  worker.start();
+  await clock.advance(0);
+
+  // The worker mints the id, hands it to runCycle, and opens the history row
+  // under it — so all three name the same cycle.
+  assert.equal(runCalls[0].opts.cycleId, 'c_worker_0001', 'runCycle is told which cycle this is');
+  assert.equal(opened[0].cycleId, 'c_worker_0001', 'and the durable row is keyed by it');
+
+  const complete = logger.entries.filter((e) => e.message === 'Cycle complete');
+  assert.equal(complete.length, 1, 'exactly one completion marker per cycle');
+  assert.equal(complete[0].meta.cycleId, 'c_worker_0001', 'the id that ties the pair together');
+  assert.equal(complete[0].meta.agentId, AGENT_ID);
+  assert.equal(complete[0].meta.outcome, OUTCOME.PUBLISHED);
+  assert.equal(complete[0].meta.failed, false);
+  assert.equal(complete[0].meta.consecutiveFailures, 0);
+
+  worker.stop();
+});
+
+test('Cycle complete names the open history row even when runCycle threw', async () => {
+  const logger = capturingLogger();
+  // _safeRunCycle's catch path builds its own failed result. The id is still
+  // real — the worker minted it and a row is already open under it — so the
+  // marker must name that row rather than reporting nothing.
+  const { worker, clock, opened, closed } = makeWorker({
+    runResults: () => { throw Object.assign(new Error('boom'), { code: 'unexpected' }); },
+    options: { logger },
+  });
+
+  worker.start();
+  await clock.advance(0);
+
+  const complete = logger.entries.filter((e) => e.message === 'Cycle complete');
+  assert.equal(complete.length, 1);
+  assert.equal(complete[0].meta.cycleId, 'cyc_1');
+  assert.equal(complete[0].meta.cycleId, opened[0].cycleId, 'the marker points at a row that exists');
+  assert.equal(closed[0].cycleId, 'cyc_1');
+  assert.equal(complete[0].meta.failed, true);
+  assert.equal(complete[0].meta.consecutiveFailures, 1);
 
   worker.stop();
 });

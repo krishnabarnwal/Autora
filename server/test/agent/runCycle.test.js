@@ -12,6 +12,7 @@ import {
 } from '../fixtures/memory.js';
 import { publishDecision, skipDecision } from '../fixtures/editorial.js';
 import { validGeneration } from '../fixtures/generation.js';
+import { clearActivity, recentActivity } from '../../src/utils/logger.js';
 
 /**
  * Phase 12 — runCycle composition.
@@ -57,6 +58,50 @@ test('a full cycle discovers, judges, generates, and publishes with exactly two 
   assert.equal(posts.length, 1);
   assert.equal(posts[0].normalizedTopic, normalizeTopic(CANDIDATE.title));
   assert.ok(result.publisher.created);
+});
+
+// --- Observability: every cycle announces its own start ----------------------
+
+test('a cycle logs its start with the agentId and cycleId, and nothing else', async () => {
+  clearActivity();
+  const agent = await seedAgent();
+  const provider = scripted([
+    { json: publishDecision({ selectedCandidateIndex: 1 }) },
+    { json: validGeneration() },
+  ]);
+
+  const result = await runCycle(agent, {
+    provider,
+    cycleId: 'c_observe_0001',
+    services: withCandidates([CANDIDATE]),
+  });
+
+  const started = recentActivity({ limit: 200 }).filter((e) => e.message === 'Cycle started');
+  assert.equal(started.length, 1, 'exactly one start marker per cycle');
+  assert.equal(started[0].tag, 'AGENT');
+  assert.equal(started[0].level, 'info');
+  // The logger hoists agentId to a top-level field so /activity can scope by it,
+  // which leaves cycleId as the entry's whole payload.
+  assert.equal(started[0].agentId, agent.agentId, 'scoped to this agent, so the dashboard can filter it');
+  assert.deepEqual(
+    Object.keys(started[0].data),
+    ['cycleId'],
+    'the marker carries the identifiers and no payload of its own'
+  );
+  assert.equal(started[0].data.cycleId, 'c_observe_0001', 'the id that ties the cycle together');
+  assert.equal(result.cycleId, 'c_observe_0001', 'and it is the id the result reports');
+});
+
+test('a paused agent logs no start marker, because no cycle ran', async () => {
+  clearActivity();
+  const agent = await seedAgent({ status: 'paused' });
+  const provider = scripted([{ json: publishDecision() }]);
+
+  const result = await runCycle(agent, { provider, services: withCandidates([CANDIDATE]) });
+
+  assert.equal(result.outcome, OUTCOME.PAUSED);
+  const started = recentActivity({ limit: 200 }).filter((e) => e.message === 'Cycle started');
+  assert.equal(started.length, 0, 'the start marker must not claim work that never happened');
 });
 
 // --- Zero-call floor: an all-BLOCKED cycle never touches the model ------------

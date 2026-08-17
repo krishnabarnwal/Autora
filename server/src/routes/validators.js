@@ -172,3 +172,27 @@ export function parseMemoryQuery(query = {}) {
 
   return parsed;
 }
+
+/**
+ * Query for GET /api/agent/:agentId/cycles — persistent execution history.
+ *
+ * Unlike the feed, this collection grows forever: one row every cycle, for the
+ * life of the agent. So the page size is small by default and firmly capped, and
+ * there is no way to ask for the whole history in one request. `before` is the
+ * cursor the previous page handed back, and it must be a real timestamp — a
+ * junk cursor is a client bug and is rejected rather than silently ignored,
+ * which would quietly return page one again forever.
+ */
+export function parseCycleQuery(query = {}) {
+  const parsed = { limit: parseLimit(query.limit, { fallback: 20, max: 100 }) };
+
+  if (query.before !== undefined) {
+    const before = new Date(query.before);
+    if (Number.isNaN(before.getTime())) {
+      throw badRequest('before_invalid', 'before must be an ISO 8601 timestamp.');
+    }
+    parsed.before = before;
+  }
+
+  return parsed;
+}

@@ -193,6 +193,12 @@ async function recordDeferredCandidate(agentId, editor, viable, cycleId, recordF
 
   const base = editor?.reason?.trim() || 'No editorial rationale was produced.';
   try {
+    // No structured `reasons` here, deliberately. The editor's rejectionReasons
+    // are per-candidate — the prompt asks for "why the others were passed over",
+    // and the mock emits "<that candidate's title> — insufficient detail" — so
+    // attaching the whole list to this one stand-in row would file reasons about
+    // other topics under this topic's decision. The cycle-level rationale is
+    // already carried, honestly and in full, by `reason` below.
     const result = await recordFn(agentId, {
       decision: 'deferred',
       topic: candidate.title,
@@ -299,6 +305,13 @@ export async function runCycle(agent, options = {}) {
     log.info('Cycle skipped: the agent is not active', { agentId, status: agent.status });
     return buildResult({ agentId, cycleId, outcome: OUTCOME.PAUSED });
   }
+
+  // The opening bracket of the cycle. Every stage below logs its own outcome and
+  // the scheduler logs 'Cycle complete' at the end, but nothing marked the start,
+  // so the activity log had no way to say where one cycle's work began — and the
+  // cycleId that ties a decision, a post, and a memory row together first became
+  // visible partway through. Carries the two identifiers and nothing else.
+  log.info('Cycle started', { agentId, cycleId });
 
   const shared = { agentId, now };
   // Only the mock provider exposes `.calls`; against real Gemini this stays 0.

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { Agent, Post, TopicMemory, personaKeyFor } from '../models/index.js';
+import { Agent, CycleRun, Post, TopicMemory, personaKeyFor } from '../models/index.js';
 import { getRecentMemory, MemoryInputError } from '../services/memory/index.js';
 import { notifyAgentInitialized } from '../utils/agentEvents.js';
 import { badRequest, notFound } from '../utils/errors.js';
@@ -8,6 +8,7 @@ import {
   parseActivityQuery,
   parseAgentId,
   parseAgentListQuery,
+  parseCycleQuery,
   parseFeedPaging,
   parseInitBody,
   parseMemoryQuery,
@@ -25,7 +26,7 @@ async function requireAgent(agentId) {
 }
 
 /**
- * Public agent API: the two endpoints named in the problem statement.
+ * Public agent API: the endpoints the dashboard and init flow rely on.
  *
  * Still inert with respect to content: these handlers read and write MongoDB and
  * hand the agent to the scheduler, but they never call the LLM, never fetch an
@@ -225,6 +226,46 @@ export function agentRouter() {
     }
 
     res.json({ memory, totals });
+  });
+
+  /**
+   * GET /api/agent/:agentId/cycles?limit=&before=
+   * Response: { "data": [ …toPublicJSON() ], "pagination": { limit, hasMore, nextCursor } }
+   *
+   * The agent's persistent execution history: one row per cycle, newest first,
+   * surviving the restarts that clear the activity buffer. This is the durable
+   * counterpart to /activity, and the difference between them is not cosmetic —
+   * a row here is an aggregate (counts, timings, the decision, the outcome), not
+   * a trace. It cannot tell you what happened *inside* a cycle, and nothing
+   * downstream may present it as though it could.
+   *
+   * Always scoped to the requested agent: the query filters on agentId and the
+   * agent must exist, so an unknown id is a 404 rather than an empty page, and no
+   * page can carry another agent's cycles. toPublicJSON is the only shape, and it
+   * has no field for a prompt, an article body, a provider payload or a key.
+   */
+  router.get('/:agentId/cycles', async (req, res) => {
+    const agentId = parseAgentId(req.params.agentId);
+    const { limit, before } = parseCycleQuery(req.query);
+    await requireAgent(agentId);
+
+    // Fetch one more than asked for: whether that extra row exists is the answer
+    // to hasMore, without a second count query over a collection that only grows.
+    const rows = await CycleRun.historyFor(agentId, { limit: limit + 1, before });
+    const page = rows.slice(0, limit);
+    const hasMore = rows.length > limit;
+    const oldest = page[page.length - 1];
+
+    res.json({
+      data: page.map((row) => row.toPublicJSON()),
+      pagination: {
+        limit,
+        hasMore,
+        // Only offered when there is genuinely another page, so a client can
+        // stop on nextCursor === null instead of re-requesting the end forever.
+        nextCursor: hasMore && oldest?.startedAt ? oldest.startedAt.toISOString() : null,
+      },
+    });
   });
 
   return router;

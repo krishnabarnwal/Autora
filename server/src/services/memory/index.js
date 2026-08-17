@@ -31,7 +31,7 @@
  * final guarantee that only one post per topic is ever stored. See
  * concurrency.test.js.
  */
-import { Post, TopicMemory, TOPIC_DECISIONS, REJECTION_REASONS } from '../../models/index.js';
+import { Post, TopicMemory, TOPIC_DECISIONS, REJECTION_REASONS, sanitizeReasons } from '../../models/index.js';
 import { normalizeTopic, jaccardSimilarity, containment, sharedTokenCount } from '../../utils/text.js';
 import { logger } from '../../utils/logger.js';
 import { config } from '../../config/env.js';
@@ -166,6 +166,15 @@ export function toMemoryView(row) {
     topic: row.topic ?? null,
     decision: row.decision ?? null,
     score: row.score ?? null,
+    // The agent's own account of the decision, exactly as it was recorded at the
+    // time. `reason` has always been stored — it is a required field — but was
+    // never projected, so the dashboard showed a verdict with no "why" beside
+    // it. `reasons` is the structured form of the same thing, and is null on any
+    // cycle that did not produce one rather than an empty list, so a reader can
+    // distinguish an editor that enumerated nothing from a cycle that never
+    // captured anything.
+    reason: row.reason ?? null,
+    reasons: Array.isArray(row.reasons) && row.reasons.length > 0 ? [...row.reasons] : null,
     rejectionCategory: row.rejectionCategory ?? null,
     postId: row.postId ?? null,
     cycleId: row.cycleId ?? null,
@@ -249,7 +258,7 @@ export async function getRecentMemory(agentId, options = {}) {
 
   try {
     const rows = await TopicMemory.find(query)
-      .select('topic normalizedTopic decision score rejectionCategory postId cycleId sourceUrls createdAt')
+      .select('topic normalizedTopic decision score reason reasons rejectionCategory postId cycleId sourceUrls createdAt')
       .sort({ createdAt: -1, _id: -1 })
       .limit(capped)
       .lean();
@@ -362,7 +371,7 @@ export async function checkRepetition(agentId, candidate, options = {}) {
     //    window. Bounded scan; the strongest match at or above threshold wins.
     const similarSince = new Date(now - similarityWindowDays * DAY_MS);
     const recent = await TopicMemory.find({ agentId: id, createdAt: { $gte: similarSince } })
-      .select('topic normalizedTopic decision score rejectionCategory postId cycleId sourceUrls createdAt')
+      .select('topic normalizedTopic decision score reason reasons rejectionCategory postId cycleId sourceUrls createdAt')
       .sort({ createdAt: -1, _id: -1 })
       .limit(Math.min(similarityScanLimit, MAX_RECENT_LIMIT))
       .lean();
@@ -420,10 +429,12 @@ export async function checkRepetition(agentId, candidate, options = {}) {
  * @param {string} agentId
  * @param {{
  *   decision?: string, topic?: string, candidate?: object, reason?: string,
- *   rejectionCategory?: string, keywords?: string[], sources?: string[],
- *   sourceUrls?: string[], score?: number, cycleId?: string,
- * }} decision the decision to record (accepts a Phase 9 result shape)
- * @param {{cycleId?: string, keywords?: string[], sources?: string[], score?: number}} [context]
+ *   reasons?: string[], rejectionCategory?: string, keywords?: string[],
+ *   sources?: string[], sourceUrls?: string[], score?: number, cycleId?: string,
+ * }} decision the decision to record (accepts a Phase 9 result shape).
+ *   `reasons` is optional structured reasoning the caller already holds — the
+ *   editor's own bullet points, never a restatement of `reason`.
+ * @param {{cycleId?: string, keywords?: string[], sources?: string[], score?: number, reasons?: string[]}} [context]
  * @returns {Promise<{recorded: true, decision: string, normalizedTopic: string, memory: object}>}
  * @throws {MemoryInputError} for invalid input (nothing is written)
  * @throws {MemoryError} for an unexpected persistence failure
@@ -468,6 +479,13 @@ export async function recordDecision(agentId, decision, context = {}) {
     );
   }
 
+  // Structured reasoning, only when the caller genuinely has some. Never split
+  // out of `reason`: a bullet list carved from prose would present the editor as
+  // having enumerated its grounds when it did not. sanitizeReasons returns
+  // undefined for an empty or absent list, so the field stays unset on the
+  // document rather than being stored as [].
+  const reasons = sanitizeReasons(decision.reasons ?? context.reasons);
+
   const keywords = Array.isArray(decision.keywords) ? decision.keywords.map(String)
     : (Array.isArray(context.keywords) ? context.keywords.map(String) : []);
   const sourceUrls = Array.isArray(decision.sourceUrls) ? decision.sourceUrls.map(String)
@@ -485,6 +503,7 @@ export async function recordDecision(agentId, decision, context = {}) {
       topic,
       decision: kind,
       reason,
+      reasons,
       rejectionCategory,
       keywords,
       sourceUrls,

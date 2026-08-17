@@ -23,6 +23,38 @@ export const REJECTION_REASONS = [
 ];
 
 /**
+ * Bounds for the structured reason list.
+ *
+ * These mirror the editorial schema's own limits (`buildDecisionSchema` allows
+ * at most 10 rejectionReasons / 5 evidence items, 300 characters each), so
+ * nothing the editor can legitimately produce is truncated on the way in. They
+ * exist to bound a malformed or hostile payload, not to reshape a valid one.
+ */
+export const MAX_REASONS = 10;
+export const MAX_REASON_LENGTH = 300;
+
+/**
+ * Normalize a structured reason list into what the schema should store.
+ *
+ * Returns `undefined` — not `[]` — when there is nothing real to keep, so an
+ * absent field stays absent and the dashboard can distinguish a cycle whose
+ * reasons were never recorded from one that recorded an empty list. Both writers
+ * (the memory service and the publisher) go through this, so neither can put a
+ * non-string, an empty string, or an unbounded blob into the audit trail.
+ */
+export function sanitizeReasons(value) {
+  if (!Array.isArray(value)) return undefined;
+  const cleaned = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue;
+    const text = entry.trim().slice(0, MAX_REASON_LENGTH);
+    if (text) cleaned.push(text);
+    if (cleaned.length === MAX_REASONS) break;
+  }
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+/**
  * Every editorial decision, published or not.
  *
  * This is the agent's memory: it powers repetition detection and it is the
@@ -41,6 +73,20 @@ const topicMemorySchema = new Schema(
     decision: { type: String, enum: TOPIC_DECISIONS, required: true, index: true },
     score: { type: Number, min: 0, max: 100, default: null },
     reason: { type: String, required: true, trim: true, maxlength: 1000 },
+    /**
+     * The structured form of the same "why", when the pipeline actually produced
+     * one. Never a paraphrase of `reason` — these are the editor's own bullet
+     * points, carried through verbatim.
+     *
+     * Optional, and `default: undefined` rather than `[]` deliberately. An
+     * empty-array default would materialise on every row written before this
+     * field existed, and the API could then no longer distinguish an editor that
+     * listed no reasons from a cycle that predates structured reasoning. The
+     * dashboard would have to guess which it was looking at, and a guess about
+     * an agent's own reasoning is a fabricated audit trail. Absent means absent,
+     * and the UI says so in as many words.
+     */
+    reasons: { type: [String], default: undefined },
     rejectionCategory: { type: String, enum: REJECTION_REASONS, default: null },
 
     // Set only when decision === 'published'.
@@ -84,6 +130,10 @@ topicMemorySchema.methods.toPublicJSON = function toPublicJSON() {
     decision: this.decision,
     score: this.score,
     reason: this.reason,
+    // Absent stays absent: a row written before structured reasoning existed
+    // reports null, never an empty list that would read as "the editor gave no
+    // reasons" when the truth is that none were ever captured.
+    reasons: this.reasons?.length ? [...this.reasons] : null,
     rejectionCategory: this.rejectionCategory,
     sources: [...this.sourceUrls],
     postId: this.postId,

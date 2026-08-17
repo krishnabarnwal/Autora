@@ -54,6 +54,58 @@ test('recordDecision persists a deferral', async () => {
   assert.equal(count, 1);
 });
 
+test('recordDecision stores structured reasons when the caller supplies them', async () => {
+  const agent = await seedAgent();
+  const res = await recordDecision(agent.agentId, {
+    decision: 'rejected',
+    topic: 'A structured-reasoning probe about model evaluation',
+    reason: 'Two independent problems with this one.',
+    reasons: ['Single unnamed source.', 'Restates a vendor announcement.'],
+  });
+
+  assert.deepEqual(res.memory.reasons, ['Single unnamed source.', 'Restates a vendor announcement.']);
+  const stored = await TopicMemory.findOne({ agentId: agent.agentId }).lean();
+  assert.deepEqual(stored.reasons, ['Single unnamed source.', 'Restates a vendor announcement.']);
+});
+
+test('recordDecision leaves reasons unset rather than empty when none are supplied', async () => {
+  // The absence has to survive to the document: an empty array here would make
+  // a cycle that recorded nothing indistinguishable from one that enumerated
+  // nothing, and the dashboard decides what to show on exactly that difference.
+  const agent = await seedAgent();
+  await recordDecision(agent.agentId, {
+    decision: 'deferred',
+    topic: 'An unenumerated probe about scheduling',
+    reason: 'Parked for a later cycle.',
+  });
+
+  const stored = await TopicMemory.findOne({ agentId: agent.agentId }).lean();
+  assert.equal(stored.reasons, undefined, 'the field is absent, not []');
+  const view = await getTopicMemory(agent.agentId, 'An unenumerated probe about scheduling');
+  assert.equal(view.reasons, null, 'the view reports absence as null');
+});
+
+test('recordDecision bounds and cleans a hostile reasons list', async () => {
+  const agent = await seedAgent();
+  const res = await recordDecision(agent.agentId, {
+    decision: 'rejected',
+    topic: 'A hostile-input probe about sanitizers',
+    reason: 'Testing the bounds.',
+    reasons: [
+      '  padded  ', '', '   ', 42, null, { nope: true },
+      'x'.repeat(500),
+      ...Array.from({ length: 20 }, (_, i) => `filler ${i}`),
+    ],
+  });
+
+  const { reasons } = res.memory;
+  assert.equal(reasons.length, 10, 'capped at MAX_REASONS');
+  assert.equal(reasons[0], 'padded', 'trimmed');
+  assert.ok(reasons.every((entry) => typeof entry === 'string' && entry.length <= 300),
+    'every entry is a bounded string');
+  assert.ok(!reasons.includes(''), 'no empty entries survive');
+});
+
 test('recordDecision accepts a Phase 9 decision shape via candidate + context', async () => {
   const agent = await seedAgent();
   // A skip-style decision carrying the candidate, plus context for cycle/score.

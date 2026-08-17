@@ -270,6 +270,10 @@ test('resumeAll spaces real workers first cycles by the boot stagger', async () 
       logger: silent,
       reload: async (id) => ({ agentId: id, status: 'autonomous', persona: { name: 'A', domain: 'D' } }),
       persist: async () => {},
+      // The history seams are stubbed out: this test is about the boot stagger,
+      // and the real ones would reach for a database it never connects to.
+      openCycleRun: async () => {},
+      closeCycleRun: async () => {},
       runCycleFn,
     },
   });

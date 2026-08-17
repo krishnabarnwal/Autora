@@ -1,41 +1,42 @@
 import { useEffect, useMemo, useState } from 'react';
-import { getActivity, getAgent, getFeed, getHealth, getMemory, listAgents } from './services/api.js';
+import { getActivity, getAgent, getCycles, getFeed, getHealth, getMemory, listAgents } from './services/api.js';
 import { usePolling } from './hooks/usePolling.js';
-import { AsyncSection, Badge, Dot, Empty, ErrorNote, Loading, Metric, Panel, Row } from './components/ui.jsx';
+import { AsyncSection, Empty, Panel, RefreshTag } from './components/ui.jsx';
 import { PipelineFlow, PipelineLegend } from './components/PipelineFlow.jsx';
-import { ActivityList, AgentCard, FeedList, MemoryList } from './components/panels.jsx';
-import {
-  classifyEvent,
-  DECISION_TONE,
-  formatClock,
-  formatInterval,
-  formatNumber,
-  relativeTime,
-} from './lib/format.js';
+import { ActivityFilter, ActivityList, FeedList, MemoryList, TotalsRow } from './components/panels.jsx';
+import { IdentityStrip } from './components/IdentityStrip.jsx';
+import { Sidebar } from './components/Sidebar.jsx';
+import { DegradedBanners } from './components/DegradedBanners.jsx';
+import { Overview } from './components/dashboard/Overview.jsx';
+import { Decisions } from './components/dashboard/Decisions.jsx';
+import { BreethPanel } from './components/dashboard/BreethPanel.jsx';
+import { SystemHealth } from './components/dashboard/SystemHealth.jsx';
+import { CycleDrawer, CycleList } from './components/dashboard/CycleDetail.jsx';
+import { HistorySummary, LoadOlderCycles } from './components/dashboard/CycleHistory.jsx';
+import { classifyEvent, formatNumber } from './lib/format.js';
+import { isProviderFailure } from './lib/health.js';
+import { buildCycles, findCycle } from './lib/cycles.js';
+import { summarizeCycleRuns } from './lib/cycleAnalytics.js';
+import { PIPELINE_SUBTITLE } from './lib/vocabulary.js';
 
 /**
- * Phase 14 — the operator dashboard.
+ * The operator dashboard.
  *
  * Every number on screen is read from the backend: /api/health, /api/agent,
- * /api/agent/:id, /api/agent/feed, /api/agent/:id/activity, and
- * /api/agent/:id/memory. Nothing is simulated, and the UI issues no write beyond
- * the init call the user explicitly triggers. Sections are client-side state
- * rather than routes, so no router dependency is needed.
+ * /api/agent/:id, /api/agent/feed, /api/agent/:id/activity,
+ * /api/agent/:id/memory, and /api/agent/:id/cycles. Nothing is simulated, and the
+ * UI issues no write beyond the init call the user explicitly triggers. Sections
+ * are client-side state rather than routes, so no router dependency is needed.
+ *
+ * This file owns the data: the polled queries, the selected agent, and which
+ * section is showing. Each section renders itself from components/dashboard/.
  */
-
-const SECTIONS = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'pipeline', label: 'Autonomous loop' },
-  { id: 'feed', label: 'Published posts' },
-  { id: 'decisions', label: 'AI decisions' },
-  { id: 'memory', label: 'Local memory' },
-  { id: 'breeth', label: 'Breeth memory' },
-  { id: 'activity', label: 'Activity log' },
-  { id: 'system', label: 'System health' },
-];
 
 const FAST_MS = 5000;
 const SLOW_MS = 10_000;
+
+/** Cycle history rows per page — the endpoint's own default, kept explicit here. */
+const HISTORY_PAGE = 20;
 
 export default function App() {
   const [section, setSection] = useState('overview');
@@ -47,6 +48,31 @@ export default function App() {
   // endpoint for the decision it should return is the only filter that agrees
   // with the totals rendered beside it.
   const [decision, setDecision] = useState('all');
+  // Which lifecycle stage the activity log is filtered to, or null for all. Held
+  // here for the same reason as `decision`: it is cleared on the way out of the
+  // section so the Overview's activity preview is never a filtered subset.
+  const [phase, setPhase] = useState(null);
+  // Which cycle the detail drawer is showing, by cycleId, or null for none.
+  // Holding the id rather than the built cycle means each poll re-renders the
+  // drawer from fresh data instead of pinning a snapshot taken when it opened.
+  const [cycleId, setCycleId] = useState(null);
+  // Pages of cycle history fetched on demand, beyond the polled first page.
+  //
+  // These are deliberately not polled. The first page keeps refreshing with the
+  // rest of the dashboard because its newest row can still be running; a cycle
+  // that finished hours ago cannot change, so re-fetching page four every ten
+  // seconds would spend requests to receive identical bytes. `agent` is carried
+  // in the state so a page that arrives after the operator has switched agents
+  // can be dropped instead of appended to the wrong history.
+  const [older, setOlder] = useState({
+    agent: null,
+    rows: [],
+    pages: 0,
+    cursor: null,
+    hasMore: false,
+    loading: false,
+    error: null,
+  });
 
   const health = usePolling(() => getHealth(), { intervalMs: SLOW_MS });
   const agents = usePolling(() => listAgents({ limit: 25 }), { intervalMs: SLOW_MS });
@@ -72,13 +98,122 @@ export default function App() {
     enabled,
     deps,
   });
+  // The newest page of persistent history. One more polled query on the existing
+  // hook — not a second polling loop — so it pauses with the tab and refreshes on
+  // the same cadence as everything else.
+  const history = usePolling(() => getCycles(agentId, { limit: HISTORY_PAGE }), {
+    intervalMs: SLOW_MS,
+    enabled,
+    deps,
+  });
+
+  // Switching agents discards the pages fetched for the previous one. Recording
+  // the new agent here is what lets an in-flight request identify itself as stale.
+  useEffect(() => {
+    setOlder({
+      agent: agentId,
+      rows: [],
+      pages: 0,
+      cursor: null,
+      hasMore: false,
+      loading: false,
+      error: null,
+    });
+  }, [agentId]);
+
+  const historyPage = history.data?.pagination ?? null;
+  // Before any manual page has loaded the cursor comes from the polled page;
+  // afterwards it comes from the last page fetched. `pages` is the discriminator
+  // rather than the cursor itself, because reaching the end of history sets the
+  // cursor to null and falling back to the first page's cursor there would offer
+  // to load the same page again forever.
+  const olderCursor = older.pages > 0 ? older.cursor : (historyPage?.nextCursor ?? null);
+  const hasOlder = Boolean(olderCursor) && (older.pages > 0 ? older.hasMore : Boolean(historyPage?.hasMore));
+
+  async function loadOlder() {
+    if (!agentId || !olderCursor || older.loading) return;
+    const forAgent = agentId;
+    setOlder((prev) => ({ ...prev, loading: true, error: null }));
+    try {
+      const page = await getCycles(forAgent, { limit: HISTORY_PAGE, before: olderCursor });
+      setOlder((prev) =>
+        prev.agent !== forAgent
+          ? prev
+          : {
+              ...prev,
+              rows: [...prev.rows, ...(page?.data || [])],
+              pages: prev.pages + 1,
+              cursor: page?.pagination?.nextCursor ?? null,
+              hasMore: Boolean(page?.pagination?.hasMore),
+              loading: false,
+              error: null,
+            }
+      );
+    } catch (error) {
+      // A failed page leaves the cursor untouched so the same click can be
+      // retried, and says so rather than looking like the end of history.
+      setOlder((prev) => (prev.agent !== forAgent ? prev : { ...prev, loading: false, error }));
+    }
+  }
 
   const events = activity.data?.events || [];
   const breethEvents = useMemo(() => events.filter((e) => classifyEvent(e) === 'breeth'), [events]);
   const rateLimited = useMemo(() => events.filter((e) => classifyEvent(e) === 'rate_limited'), [events]);
+  // Provider failures that are not rate limits — a timeout, a schema violation, a
+  // blocked completion. Counted separately so a 429 is never folded into a
+  // generic "error" total and quietly lose its identity.
+  const providerErrors = useMemo(
+    () => events.filter((e) => isProviderFailure(e) && classifyEvent(e) !== 'rate_limited'),
+    [events]
+  );
 
   const agent = detail.data?.agent || null;
   const breethEnabled = Boolean(health.data?.breethEnabled);
+
+  // The polled first page plus every page loaded since, newest first.
+  //
+  // Deduplicated by cycleId because the two sources can in principle name the
+  // same execution: the cursor is exclusive so an older page cannot repeat a row
+  // that was on page one when it was requested, but page one keeps refreshing,
+  // and a row is only ever more trustworthy on the fresher read. First occurrence
+  // wins for that reason. A row with no cycleId is kept — it cannot be joined to
+  // a traced cycle, but it is still a real execution and belongs in the totals.
+  const runs = useMemo(() => {
+    const merged = [];
+    const seen = new Set();
+    for (const row of [...(history.data?.data || []), ...older.rows]) {
+      if (!row) continue;
+      if (row.cycleId) {
+        if (seen.has(row.cycleId)) continue;
+        seen.add(row.cycleId);
+      }
+      merged.push(row);
+    }
+    return merged;
+  }, [history.data, older.rows]);
+
+  const historySummary = useMemo(() => summarizeCycleRuns(runs), [runs]);
+
+  // Cycles are derived, not fetched: lib/cycles.js reads the four responses
+  // already polled above and joins them on cycleId. Recomputed only when one of
+  // those actually changes.
+  //
+  // Three tiers land in one list. A cycle still in the activity buffer gets a
+  // full trace; one that has aged out of the buffer but wrote a durable row gets
+  // counts and timings; one that only left a decision behind gets that. The
+  // drawer labels which it is looking at, so an aggregate is never presented as
+  // a trace.
+  //
+  // The memory rows are the same ones the Decisions section fetches, and that
+  // query carries its decision filter. Leaving that section resets the filter to
+  // 'all' (see onSelect below), so the rows backing this list are the unfiltered
+  // window whenever the list is on screen. Were that reset removed, this list
+  // would silently lose every cycle whose decision the user had filtered out.
+  const cycles = useMemo(
+    () => buildCycles({ events, memory: memory.data?.memory, posts: feed.data?.posts, runs }),
+    [events, memory.data, feed.data, runs]
+  );
+  const selectedCycle = findCycle(cycles, cycleId);
 
   return (
     <div className="mx-auto flex min-h-full max-w-[1400px] flex-col gap-5 px-4 py-6 lg:flex-row lg:px-6">
@@ -91,6 +226,11 @@ export default function App() {
           // the panels that share this query — Local memory, and Overview's
           // latest-decisions list — from silently showing a filtered subset.
           if (id !== 'decisions') setDecision('all');
+          if (id !== 'activity') setPhase(null);
+          // The drawer is opened from two sections — Overview's recent-runs list
+          // and the Autonomous loop's full list. Leaving both of them closes it,
+          // rather than having it reappear over a section that never opened it.
+          if (id !== 'pipeline' && id !== 'overview') setCycleId(null);
         }}
         agents={agentList}
         agentId={agentId}
@@ -101,8 +241,12 @@ export default function App() {
       <main className="min-w-0 flex-1 space-y-5">
         <DegradedBanners health={health} detail={detail.data} rateLimited={rateLimited} />
 
-        <AgentCard detail={detail.data} loading={detail.loading && !detail.data} error={!agentId ? null : detail.error} />
-
+        {/* The Overview leads with the Hero, its own full identity surface, so the
+            strip would only duplicate it there. Every other section gets the slim
+            strip: product first, agent as a subordinate identifier, live status. */}
+        {section !== 'overview' && (
+          <IdentityStrip agent={agent} health={health} events={events} detail={detail} />
+        )}
         {!agentId && !agents.loading && agentList.length === 0 && (
           <Panel title="No agent yet">
             <Empty
@@ -118,15 +262,22 @@ export default function App() {
             feed={feed}
             memory={memory}
             activity={activity}
+            events={events}
+            cycles={cycles}
+            selectedCycleId={cycleId}
+            onSelectCycle={setCycleId}
+            historySummary={historySummary}
+            history={history}
             breethEvents={breethEvents}
             breethEnabled={breethEnabled}
+            health={health}
           />
         )}
 
         {section === 'pipeline' && (
           <Panel
             title="Autonomous loop"
-            subtitle="Live sources → discovery → filtering → dedup → candidates → editorial → generation → publishing → local memory → Breeth → next cycle"
+            subtitle={PIPELINE_SUBTITLE}
             actions={<RefreshTag query={detail} />}
           >
             <PipelineFlow
@@ -134,9 +285,61 @@ export default function App() {
               counts={detail.data?.counts}
               breethEnabled={breethEnabled}
               breethActivity={breethEvents.length}
+              events={events}
+              status={agent?.status}
+              stale={activity.stale}
             />
             <div className="mt-4">
               <PipelineLegend />
+            </div>
+
+            {/*
+              The loop above is the agent's cadence in aggregate; this is each
+              individual pass through it. Selecting one opens the detail drawer,
+              which is where a reader can see what that specific cycle discovered,
+              decided, published and remembered.
+            */}
+            <div className="mt-5 border-t border-ink-800 pt-4">
+              <h3 className="font-mono text-[11px] tracking-[0.18em] text-ink-500 uppercase">
+                Historical execution summary
+              </h3>
+              <p className="mt-1 mb-3 text-xs leading-relaxed text-ink-500">
+                Aggregated from the durable row each cycle writes — this outlives the
+                restarts that clear the activity buffer.
+              </p>
+              <HistorySummary
+                summary={historySummary}
+                loading={history.loading && !history.data}
+                error={history.data ? null : history.error}
+              />
+            </div>
+
+            <div className="mt-5 border-t border-ink-800 pt-4">
+              <h3 className="font-mono text-[11px] tracking-[0.18em] text-ink-500 uppercase">
+                Recent cycles
+              </h3>
+              <p className="mt-1 mb-3 text-xs leading-relaxed text-ink-500">
+                Select a cycle to inspect its stages, decision and output.
+                {agent?.stats?.cyclesRun !== undefined && (
+                  <>
+                    {' '}
+                    This agent has run{' '}
+                    <span className="autora-numeric text-ink-300">
+                      {formatNumber(agent.stats.cyclesRun)}
+                    </span>{' '}
+                    cycles in total. The most recent are traced in full; older ones are
+                    the persisted record of the execution, without the trace.
+                  </>
+                )}
+              </p>
+              <CycleList cycles={cycles} selectedId={cycleId} onSelect={setCycleId} />
+              <LoadOlderCycles
+                hasMore={hasOlder}
+                loading={older.loading}
+                error={older.error}
+                onLoad={loadOlder}
+                loaded={runs.length}
+              />
             </div>
           </Panel>
         )}
@@ -177,407 +380,35 @@ export default function App() {
         {section === 'activity' && (
           <Panel
             title="Autonomous activity"
-            subtitle="In-memory buffer — process-local, cleared on restart"
+            subtitle="Every lifecycle event the agent logged — in-memory buffer, process-local, cleared on restart"
             actions={<RefreshTag query={activity} />}
           >
             <AsyncSection query={activity} loadingLabel="Loading activity…" empty="No activity data.">
-              {(data) => <ActivityList data={data} />}
+              {(data) => (
+                <>
+                  <ActivityFilter data={data} value={phase} onChange={setPhase} />
+                  <ActivityList data={data} filter={phase} />
+                </>
+              )}
             </AsyncSection>
           </Panel>
         )}
 
-        {section === 'system' && <SystemHealth health={health} agent={agent} rateLimited={rateLimited} />}
-      </main>
-    </div>
-  );
-}
-
-function Sidebar({ section, onSelect, agents, agentId, onSelectAgent, health }) {
-  const connected = Boolean(health.data?.ok);
-  const tone = health.error ? 'bad' : connected ? 'good' : 'warn';
-
-  return (
-    <aside className="lg:w-60 lg:shrink-0">
-      <div className="lg:sticky lg:top-6 space-y-4">
-        <div>
-          <p className="font-mono text-[10px] tracking-[0.2em] text-ink-500 uppercase">Problem Statement 3</p>
-          <h1 className="mt-1 text-lg leading-tight font-semibold text-white">Autonomous AI Creator</h1>
-          <div className="mt-2 flex items-center gap-2">
-            <Dot tone={tone} pulse={connected} />
-            <span className="font-mono text-[11px] text-ink-500">
-              {health.error ? 'backend unreachable' : connected ? 'backend live' : 'connecting…'}
-            </span>
-          </div>
-        </div>
-
-        {agents.length > 1 && (
-          <label className="block">
-            <span className="font-mono text-[10px] tracking-[0.16em] text-ink-500 uppercase">Agent</span>
-            <select
-              value={agentId || ''}
-              onChange={(event) => onSelectAgent(event.target.value)}
-              className="mt-1.5 w-full rounded-lg border border-ink-700 bg-ink-900 px-2.5 py-2 text-sm text-ink-300"
-            >
-              {agents.map((a) => (
-                <option key={a.agentId} value={a.agentId}>
-                  {a.persona?.name} — {a.status}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-
-        <nav aria-label="Dashboard sections">
-          <ul className="flex gap-1.5 overflow-x-auto pb-1 lg:flex-col lg:overflow-visible">
-            {SECTIONS.map((item) => {
-              const active = section === item.id;
-              return (
-                <li key={item.id} className="shrink-0 lg:shrink">
-                  <button
-                    type="button"
-                    onClick={() => onSelect(item.id)}
-                    aria-current={active ? 'page' : undefined}
-                    className={`w-full rounded-lg px-3 py-2 text-left text-sm whitespace-nowrap transition ${
-                      active
-                        ? 'border border-accent/40 bg-accent/10 text-white'
-                        : 'border border-transparent text-ink-500 hover:bg-ink-900 hover:text-ink-300'
-                    }`}
-                  >
-                    {item.label}
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </nav>
-      </div>
-    </aside>
-  );
-}
-
-function RefreshTag({ query }) {
-  if (!query?.lastUpdated) return null;
-  return (
-    <span className="font-mono text-[11px] text-ink-500">
-      {query.stale ? 'stale · ' : ''}
-      updated {formatClock(query.lastUpdated.toISOString())}
-    </span>
-  );
-}
-
-function TotalsRow({ totals }) {
-  if (!totals) return null;
-  return (
-    <div className="mb-4 flex flex-wrap gap-2">
-      {['published', 'rejected', 'deferred'].map((key) => (
-        <Badge key={key} tone={DECISION_TONE[key]}>
-          {key}: {formatNumber(totals[key])}
-        </Badge>
-      ))}
-    </div>
-  );
-}
-
-function DegradedBanners({ health, detail, rateLimited }) {
-  const notes = [];
-  const agent = detail?.agent;
-
-  if (health.error) {
-    notes.push({
-      tone: 'bad',
-      text: 'The backend is unreachable. Every panel below shows the last successful read, if any.',
-    });
-  } else if (health.data && health.data.ok === false) {
-    notes.push({
-      tone: 'bad',
-      text: `Backend reports not ready — database ${health.data.database?.status || 'unavailable'}.`,
-    });
-  }
-
-  if (rateLimited.length > 0) {
-    notes.push({
-      tone: 'warn',
-      text: `Provider rate limiting or quota pressure reported in ${rateLimited.length} recent event(s). The agent keeps cycling; generation may be skipped.`,
-    });
-  }
-
-  if (agent?.status === 'error' && detail?.lastError?.message) {
-    notes.push({
-      tone: 'warn',
-      text: `Last cycle failed: ${detail.lastError.message}${
-        relativeTime(detail.lastError.at) ? ` (${relativeTime(detail.lastError.at)})` : ''
-      }`,
-    });
-  }
-
-  if (notes.length === 0) return null;
-
-  return (
-    <div className="space-y-2">
-      {notes.map((note, index) => (
-        <div
-          key={index}
-          role="alert"
-          className={`flex items-start gap-2.5 rounded-lg border px-4 py-2.5 text-sm ${
-            note.tone === 'bad'
-              ? 'border-red-400/30 bg-red-400/5 text-red-400'
-              : 'border-amber-400/30 bg-amber-400/5 text-amber-400'
-          }`}
-        >
-          <Dot tone={note.tone} />
-          <span>{note.text}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function Overview({ detail, feed, memory, activity, breethEvents, breethEnabled }) {
-  const agent = detail.data?.agent;
-  const totals = memory.data?.totals;
-
-  return (
-    <div className="space-y-5">
-      <Panel
-        title="Autonomous loop"
-        subtitle="Sources → discovery → filtering → dedup → candidates → editorial → generation → publishing → memory → Breeth → next cycle"
-        actions={<RefreshTag query={detail} />}
-      >
-        <PipelineFlow
-          stats={agent?.stats}
-          counts={detail.data?.counts}
-          breethEnabled={breethEnabled}
-          breethActivity={breethEvents.length}
-        />
-      </Panel>
-
-      <div className="grid gap-5 xl:grid-cols-2">
-        <Panel title="Latest activity" subtitle="Newest first" actions={<RefreshTag query={activity} />}>
-          <AsyncSection query={activity} loadingLabel="Loading activity…" empty="No activity data.">
-            {(data) => <ActivityList data={{ events: (data.events || []).slice(0, 8) }} />}
-          </AsyncSection>
-        </Panel>
-
-        <Panel title="Latest posts" subtitle="GET /api/agent/feed" actions={<RefreshTag query={feed} />}>
-          <AsyncSection query={feed} loadingLabel="Loading the feed…" empty="No feed data.">
-            {(data) => <FeedList data={{ posts: (data.posts || []).slice(0, 4) }} />}
-          </AsyncSection>
-        </Panel>
-
-        <Panel title="Latest decisions" subtitle="Local memory, MongoDB" actions={<RefreshTag query={memory} />}>
-          <AsyncSection query={memory} loadingLabel="Loading memory…" empty="No memory data.">
-            {(data) => (
-              <>
-                <TotalsRow totals={totals} />
-                <MemoryList data={{ memory: (data.memory || []).slice(0, 6) }} />
-              </>
-            )}
-          </AsyncSection>
-        </Panel>
-
-        <Panel title="Breeth strategic memory" subtitle="Optional, non-authoritative">
-          <BreethSummary enabled={breethEnabled} events={breethEvents} />
-        </Panel>
-      </div>
-    </div>
-  );
-}
-
-function Decisions({ memory, filter, onFilter }) {
-  return (
-    <Panel
-      title="AI editorial decisions"
-      subtitle="Every candidate the agent judged — published, rejected, or deferred"
-      actions={<RefreshTag query={memory} />}
-    >
-      <AsyncSection query={memory} loadingLabel="Loading decisions…" empty="No decision data.">
-        {(data) => {
-          // The rows are already the decision the user asked for: the filter is
-          // sent to /memory rather than applied here, so a decision with few
-          // recent rows still shows them.
-          const rows = data.memory || [];
-          return (
-            <>
-              <div className="mb-4 flex flex-wrap gap-1.5">
-                {['all', 'published', 'rejected', 'deferred'].map((key) => (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => onFilter(key)}
-                    className={`rounded-full border px-3 py-1 font-mono text-[11px] transition ${
-                      filter === key
-                        ? 'border-accent/50 bg-accent/10 text-white'
-                        : 'border-ink-700 text-ink-500 hover:text-ink-300'
-                    }`}
-                  >
-                    {key}
-                    {key !== 'all' && data.totals ? ` (${formatNumber(data.totals[key])})` : ''}
-                  </button>
-                ))}
-              </div>
-              {rows.length === 0 ? (
-                <Empty
-                  title={`No ${filter} decisions recorded yet.`}
-                  hint="Totals above cover the agent's whole history; the list shows the most recent window."
-                />
-              ) : (
-                <MemoryList data={{ memory: rows }} />
-              )}
-            </>
-          );
-        }}
-      </AsyncSection>
-    </Panel>
-  );
-}
-
-function BreethSummary({ enabled, events }) {
-  if (!enabled) {
-    return (
-      <div className="space-y-2.5">
-        <Badge tone="muted">disabled</Badge>
-        <p className="text-sm leading-relaxed text-ink-500">
-          Breeth is an optional strategic-memory layer. It is switched off, and the agent runs
-          exactly as it does with it on — MongoDB remains authoritative for duplicate prevention and
-          repetition checks.
-        </p>
-      </div>
-    );
-  }
-
-  const failures = events.filter((e) => e.level === 'warn' || e.level === 'error');
-  const writes = events.filter((e) => e.level === 'info');
-
-  return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap gap-2">
-        <Badge tone="info">enabled</Badge>
-        {failures.length > 0 && <Badge tone="warn">{failures.length} degraded event(s)</Badge>}
-        {writes.length > 0 && <Badge tone="good">{writes.length} episode write(s)</Badge>}
-      </div>
-      {events.length === 0 ? (
-        <p className="text-sm text-ink-500">
-          Enabled, but no Breeth event has been buffered yet this process. One episode is recorded
-          per cycle at most.
-        </p>
-      ) : (
-        <ActivityList data={{ events: events.slice(0, 5) }} />
-      )}
-      <p className="text-xs leading-relaxed text-ink-500">
-        Non-authoritative by design: a Breeth outage is logged and ignored. It never fails a cycle,
-        never blocks publishing, and never overrides a MongoDB decision.
-      </p>
-    </div>
-  );
-}
-
-function BreethPanel({ enabled, events, query }) {
-  return (
-    <div className="space-y-5">
-      <Panel
-        title="Breeth strategic memory"
-        subtitle="Optional layer — MongoDB stays authoritative"
-        actions={<RefreshTag query={query} />}
-      >
-        <BreethSummary enabled={enabled} events={events} />
-      </Panel>
-
-      <Panel title="Boundary">
-        <dl className="space-y-2.5">
-          <Row label="Duplicate prevention" value="MongoDB" tone="good" />
-          <Row label="Repetition checks" value="MongoDB" tone="good" />
-          <Row label="Published-topic authority" value="MongoDB" tone="good" />
-          <Row label="Audit history" value="MongoDB" tone="good" />
-          <Row label="Breeth is authoritative for" value="nothing" tone="muted" />
-          <Row
-            label="Retrieval in the decision path"
-            value={enabled ? 'implemented, not consulted' : 'not consulted'}
-            tone="muted"
+        {section === 'system' && (
+          <SystemHealth
+            health={health}
+            agent={agent}
+            lastError={detail.data?.lastError}
+            events={events}
+            rateLimited={rateLimited}
+            providerErrors={providerErrors}
           />
-        </dl>
-      </Panel>
+        )}
+      </main>
+
+      {/* Rendered outside <main> because it is a modal layer over the whole
+          dashboard, not a part of the section that opened it. */}
+      <CycleDrawer cycle={selectedCycle} onClose={() => setCycleId(null)} />
     </div>
   );
-}
-
-function SystemHealth({ health, agent, rateLimited }) {
-  return (
-    <div className="space-y-5">
-      <Panel title="System health" subtitle="GET /api/health" actions={<RefreshTag query={health} />}>
-        <AsyncSection
-          query={health}
-          loadingLabel="Checking the backend…"
-          empty="No health data."
-          errorHint="Start the backend with npm run dev inside server/."
-        >
-          {(data) => (
-            <>
-              <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <Metric label="API" value={data.ok ? 'ready' : 'degraded'} tone={data.ok ? 'good' : 'bad'} />
-                <Metric
-                  label="Database"
-                  value={data.database?.status || 'unknown'}
-                  tone={data.database?.healthy ? 'good' : 'bad'}
-                  hint={
-                    data.database?.ping?.ok ? `ping ${data.database.ping.latencyMs}ms` : data.database?.ping?.error
-                  }
-                />
-                <Metric label="Uptime" value={formatUptime(data.uptimeSeconds)} />
-                <Metric
-                  label="Rate-limit events"
-                  value={rateLimited.length}
-                  tone={rateLimited.length > 0 ? 'warn' : 'good'}
-                  hint="in the current buffer"
-                />
-              </div>
-              <dl className="grid gap-x-8 gap-y-2.5 sm:grid-cols-2">
-                <Row label="Environment" value={data.env} />
-                <Row label="Agent mode" value={data.agentMode} />
-                <Row label="Cycle interval" value={formatInterval(data.cycleIntervalMs)} />
-                <Row label="LLM provider" value={data.llmProvider} />
-                <Row label="LLM model" value={data.llmModel} />
-                <Row
-                  label="LLM key"
-                  value={data.llmConfigured ? 'configured' : 'not set'}
-                  tone={data.llmConfigured ? 'good' : 'warn'}
-                />
-                <Row
-                  label="Database configured"
-                  value={data.databaseConfigured ? 'yes' : 'no'}
-                  tone={data.databaseConfigured ? 'good' : 'warn'}
-                />
-                <Row
-                  label="Breeth"
-                  value={data.breethEnabled ? 'enabled' : 'disabled'}
-                  tone={data.breethEnabled ? 'info' : 'muted'}
-                />
-              </dl>
-              <p className="mt-4 text-xs leading-relaxed text-ink-500">
-                Health reports configuration flags only — booleans and provider names. No key, URI,
-                or credential is ever sent to the browser.
-              </p>
-            </>
-          )}
-        </AsyncSection>
-      </Panel>
-
-      {agent && (
-        <Panel title="Scheduler" subtitle="Read-only — this dashboard cannot pause or resume the agent">
-          <dl className="grid gap-x-8 gap-y-2.5 sm:grid-cols-2">
-            <Row label="Status" value={agent.status} />
-            <Row label="Cycles run" value={formatNumber(agent.stats?.cyclesRun)} />
-            <Row label="Cycles failed" value={formatNumber(agent.stats?.cyclesFailed)} tone={agent.stats?.cyclesFailed > 0 ? 'warn' : 'plain'} />
-            <Row label="Next cycle" value={relativeTime(agent.nextCycleAt) ?? '—'} />
-          </dl>
-        </Panel>
-      )}
-    </div>
-  );
-}
-
-function formatUptime(seconds) {
-  if (!Number.isFinite(seconds)) return '—';
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }

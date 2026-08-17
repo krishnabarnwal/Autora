@@ -84,6 +84,17 @@ export function getMemory(agentId, { limit, days, decision } = {}) {
   return request(`/api/agent/${encodeURIComponent(agentId)}/memory${qs({ limit, days, decision })}`);
 }
 
+/**
+ * Persistent cycle history, newest first — one aggregate row per execution.
+ *
+ * The durable counterpart to getActivity: this survives a restart, but a row is
+ * counts and timings, not a trace. `before` is the cursor the previous page
+ * returned in pagination.nextCursor.
+ */
+export function getCycles(agentId, { limit, before } = {}) {
+  return request(`/api/agent/${encodeURIComponent(agentId)}/cycles${qs({ limit, before })}`);
+}
+
 /** Idempotent by persona: returns the existing agentId if one already matches. */
 export function initAgent(persona) {
   return request('/api/agent/init', { method: 'POST', body: JSON.stringify({ persona }) });
